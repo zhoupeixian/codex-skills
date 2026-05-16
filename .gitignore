@@ -2,3 +2,5 @@ backups/
 *.audit.md
 *.pack.json
 skill-ui-pack*.json
+*.tmp
+.DS_Store
