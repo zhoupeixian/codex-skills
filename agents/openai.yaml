@@ -1,0 +1,3 @@
+﻿interface:
+  short_description: "提取、翻译、应用、校验并回滚 Codex 技能元数据"
+  default_prompt: "Use $localize-codex-skills to extract active skill metadata, translate UI descriptions safely, apply changes with backups, verify coverage, and generate a rollback script."
