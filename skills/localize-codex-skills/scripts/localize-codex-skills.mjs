@@ -370,6 +370,10 @@ function packItemId(skillFile) {
   return `skill-ui::${skillFile}`;
 }
 
+function uiPackItemId(uiFile) {
+  return `skill-ui-shadow::${uiFile}`;
+}
+
 function classifyPromptSource(promptFile) {
   const normalized = promptFile.toLowerCase();
   if (normalized.includes('\\.codex\\superpowers\\skills\\')) return 'prompt-template';
@@ -467,18 +471,6 @@ function resolveSkillTarget(skillFile, uiFile) {
     };
   }
 
-  if (
-    normalized.includes('\\.codex\\superpowers\\skills\\') ||
-    normalized.includes('\\.codex\\.tmp\\plugins\\plugins\\superpowers\\skills\\') ||
-    normalized.includes('\\.codex\\plugins\\cache\\openai-curated\\superpowers\\')
-  ) {
-    return {
-      targetFile: skillFile,
-      targetField: 'SKILL.md.description',
-      displayField: 'SKILL.md.description',
-    };
-  }
-
   return {
     targetFile: uiFile,
     targetField: 'agents/openai.yaml.interface.short_description',
@@ -533,8 +525,27 @@ async function buildPack(customRoots) {
       targetField: target.targetField,
       original: visibleCurrent || currentUi?.short_description || shortFromMetadata || description,
       translation: '',
-      risk: target.targetField === 'SKILL.md.description' ? 'high' : 'low',
+      risk: 'low',
     });
+
+    if (
+      target.targetField === 'plugin.json.interface.longDescription' &&
+      currentUi?.short_description
+    ) {
+      items.push({
+        id: uiPackItemId(uiFile),
+        name,
+        sourceFamily: classifySource(skillFile),
+        skillFile,
+        uiFile,
+        targetFile: uiFile,
+        sourceField: 'agents/openai.yaml.interface.short_description',
+        targetField: 'agents/openai.yaml.interface.short_description',
+        original: currentUi.short_description,
+        translation: '',
+        risk: 'low',
+      });
+    }
   }
 
   const promptFiles = await discoverPromptFiles();
@@ -778,6 +789,7 @@ async function verifyPack(pack) {
       rows.push({
         name: item.name,
         sourceFamily: item.sourceFamily,
+        risk: item.risk || 'low',
         skillFile: item.skillFile,
         uiFile: item.uiFile,
         sourceField: item.sourceField,
@@ -798,6 +810,7 @@ async function verifyPack(pack) {
       rows.push({
         name: item.name,
         sourceFamily: item.sourceFamily,
+        risk: item.risk || 'low',
         skillFile: item.skillFile,
         uiFile: targetFile,
         sourceField: item.sourceField,
@@ -811,6 +824,9 @@ async function verifyPack(pack) {
       continue;
     }
     const targetText = await fs.readFile(targetFile, 'utf8');
+    const pluginJson = item.targetField?.startsWith('plugin.json.interface.')
+      ? parsePluginJson(targetText)
+      : null;
     const currentValue = item.targetField === 'prompt.frontmatter.description'
       ? readTopLevelField(parseFrontmatter(targetText)?.frontmatterLines || [], 'description')
       : item.targetField === 'prompt.frontmatter.argument-hint'
@@ -822,17 +838,23 @@ async function verifyPack(pack) {
       : item.targetField === 'SKILL.md.description'
         ? readTopLevelField(parseFrontmatter(targetText)?.frontmatterLines || [], 'description')
       : item.targetField === 'plugin.json.interface.longDescription'
-        ? parsePluginJson(targetText)?.interface?.longDescription
+        ? pluginJson?.interface?.longDescription
       : item.targetField === 'plugin.json.interface.shortDescription'
-        ? parsePluginJson(targetText)?.interface?.shortDescription
+        ? pluginJson?.interface?.shortDescription
       : parseOpenAiYaml(targetText).short_description;
-    if (currentValue !== translation) {
+    const pluginShortValue = item.targetField === 'plugin.json.interface.longDescription'
+      ? pluginJson?.interface?.shortDescription
+      : null;
+    if (currentValue !== translation || (pluginShortValue !== null && pluginShortValue !== translation)) {
       mismatch += 1;
-      const note = `expected "${translation}" but found "${currentValue ?? ''}"`;
+      const note = pluginShortValue !== null && pluginShortValue !== translation
+        ? `expected "${translation}" but found long="${currentValue ?? ''}", short="${pluginShortValue ?? ''}"`
+        : `expected "${translation}" but found "${currentValue ?? ''}"`;
       problems.push(`${item.name}: ${note}`);
       rows.push({
         name: item.name,
         sourceFamily: item.sourceFamily,
+        risk: item.risk || 'low',
         skillFile: item.skillFile,
         uiFile: targetFile,
         sourceField: item.sourceField,
@@ -849,6 +871,7 @@ async function verifyPack(pack) {
     rows.push({
       name: item.name,
       sourceFamily: item.sourceFamily,
+      risk: item.risk || 'low',
       skillFile: item.skillFile,
       uiFile: targetFile,
       sourceField: item.sourceField,
@@ -912,13 +935,21 @@ function buildAuditReport({ packPath, pack, verification }) {
     lines.push(`| ${escapeCell(status)} | ${count} |`);
   }
   lines.push('');
+  lines.push('## Risk Summary');
+  lines.push('');
+  lines.push('| Risk | Count |');
+  lines.push('| --- | ---: |');
+  for (const [risk, count] of summarizeBy(verification.rows, 'risk')) {
+    lines.push(`| ${escapeCell(risk)} | ${count} |`);
+  }
+  lines.push('');
   lines.push('## Bilingual Audit Table');
   lines.push('');
-  lines.push('| # | Skill | Family | Source field | Target field | Original | Translation | Current text | Status | Note |');
-  lines.push('| ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+  lines.push('| # | Skill | Family | Risk | Source field | Target field | Original | Translation | Current text | Status | Note |');
+  lines.push('| ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
   verification.rows.forEach((row, index) => {
     lines.push(
-      `| ${index + 1} | ${escapeCell(row.name)} | ${escapeCell(row.sourceFamily)} | ${escapeCell(row.sourceField)} | ${escapeCell(row.targetField)} | ${escapeCell(row.original)} | ${escapeCell(row.translation)} | ${escapeCell(row.currentUi)} | ${escapeCell(row.status)} | ${escapeCell(row.note)} |`,
+      `| ${index + 1} | ${escapeCell(row.name)} | ${escapeCell(row.sourceFamily)} | ${escapeCell(row.risk)} | ${escapeCell(row.sourceField)} | ${escapeCell(row.targetField)} | ${escapeCell(row.original)} | ${escapeCell(row.translation)} | ${escapeCell(row.currentUi)} | ${escapeCell(row.status)} | ${escapeCell(row.note)} |`,
     );
   });
   lines.push('');
