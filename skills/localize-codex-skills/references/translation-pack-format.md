@@ -1,59 +1,61 @@
-# Translation Pack Format
+# 翻译包格式
 
-The extraction script writes one JSON pack that drives apply, verify, rollback, and audit reporting.
+提取脚本会生成一个 JSON 文档，用于驱动应用、校验、报表和回滚。
 
 ```json
 {
   "generatedAt": "2026-05-16T08:00:00.000Z",
-  "strategy": "ui-shadow-plus-prompt-audit",
-  "itemCount": 1,
+  "strategy": "in-place-plugin-cache-plus-audit",
+  "itemCount": 3,
+  "shadowedCount": 1,
   "items": [
     {
-      "id": "skill-ui::C:\\path\\to\\SKILL.md",
-      "name": "example-skill",
-      "sourceFamily": "user-skill",
+      "id": "skill::brainstorming::c:\\path\\to\\skill",
+      "kind": "skill",
+      "name": "brainstorming",
+      "sourceFamily": "plugin-curated",
       "skillFile": "C:\\path\\to\\SKILL.md",
-      "uiFile": "C:\\path\\to\\agents\\openai.yaml",
-      "targetFile": "C:\\path\\to\\agents\\openai.yaml",
+      "skillRoot": "C:\\path\\to\\skill",
+      "targetRoot": "C:\\Users\\me\\.codex\\plugins\\cache\\openai-curated\\superpowers\\ed8ce2ea\\skills\\brainstorming",
+      "targetFile": "C:\\Users\\me\\.codex\\plugins\\cache\\openai-curated\\superpowers\\ed8ce2ea\\skills\\brainstorming\\agents\\openai.yaml",
       "sourceField": "SKILL.md.description",
       "targetField": "agents/openai.yaml.interface.short_description",
-      "original": "English source text",
+      "original": "Explore intent, requirements, and design before implementation",
       "translation": "",
-      "risk": "low"
+      "risk": "low",
+      "visible": true,
+      "shadowTarget": false
+    }
+  ],
+  "shadowedItems": [
+    {
+      "name": "code-review",
+      "skillFile": "C:\\path\\to\\shadowed\\SKILL.md",
+      "shadowedBy": "C:\\path\\to\\winner\\SKILL.md",
+      "targetRoot": "C:\\Users\\me\\.codex\\skills\\code-review"
     }
   ]
 }
 ```
 
-## Editable Field
+## 编辑规则
 
-- Edit only `translation`.
-- Leave `translation` empty for items that should not be applied.
-- Do not change ids, paths, source text, fields, or risk labels.
+- 只填写 `translation`。
+- 不要改 `id`。
+- 不要改路径或目标字段。
+- 译文要简洁、忠实原意。
+- 暂时不该汉化的项保持空译文。
 
-## Risk Labels
+## 应用规则
 
-- `low`: UI metadata such as `agents/openai.yaml` `interface.short_description` or plugin UI descriptions.
-- `high`: trigger or prompt metadata such as `SKILL.md` `description`, prompt frontmatter, or Superpowers prompt-template task descriptions.
+应用步骤只写入 `translation` 非空的项。
 
-## Apply Rules
+插件、Bundled、Superpowers 等来源直接写回各自缓存目录中的 `agents/openai.yaml`，不要复制到 `~/.agents/skills`。
 
-- Apply writes only items whose `translation` is non-empty.
-- High-risk items are rejected unless `--allow-high-risk` is passed.
-- Every apply creates backups, a manifest, and `rollback.ps1`.
+## 校验规则
 
-## Verify Rules
+校验步骤会比较当前目标字段和 `translation` 是否一致。
 
-- Verify compares each target field with the pack's `translation`.
-- Missing translations are reported but do not fail the command.
-- Mismatches fail verification and must be fixed before claiming completion.
+## 审计规则
 
-## Audit Rules
-
-Every real run must generate a report with:
-
-- complete scanned item inventory
-- source and target fields
-- original and translated text
-- current applied text
-- verification status and notes
+报表必须分别列出可见项和被遮蔽项，并保留中英文对照、目标文件、当前值和状态。

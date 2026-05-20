@@ -1,47 +1,49 @@
-# Safety Surfaces
+# 安全边界
 
-Use this file to decide which metadata is safe to localize.
+用这个文件判断哪些元数据适合汉化。
 
-## Low Risk
+## 低风险
 
 - `agents/openai.yaml` `interface.short_description`
 
-Why:
+原因：
 
-- UI-facing metadata
-- intended for skill lists and chips
-- can be added even when the skill originally had no UI metadata
-- least likely to affect automatic skill routing
+- 面向 UI 展示
+- 用于 skill 列表和标签
+- 对真实个人 skill 可直接原地写入
+- 对插件和 Bundled skill，应写回插件缓存里的 `agents/openai.yaml`
+- 最不容易影响自动 skill 调度
 
-## Medium Risk
+## 中风险
 
 - `agents/openai.yaml` `interface.display_name`
 - `agents/openai.yaml` `interface.default_prompt`
 - slash-command style prompt hints or other human-facing launcher text
 
-Why:
+原因：
 
-- mainly UI-facing, but can shape how users invoke a skill
-- usually safe, but not necessary if the user only wants descriptions localized
+- 主要面向 UI，但可能影响用户如何调用 skill
+- 通常可控，但如果只需要汉化描述，不必修改
 
-## High Risk
+## 高风险
 
 - `SKILL.md` frontmatter `description`
 - prompt frontmatter `description`
 - prompt frontmatter `argument-hint`
-- `superpowers/skills/*-prompt.md` frontmatter `description` and `argument-hint`
+- `superpowers/skills/*-prompt.md` frontmatter `description`
+- `superpowers/skills/*-prompt.md` frontmatter `argument-hint`
 
-Why:
+原因：
 
-- these fields are often part of the model-facing routing layer
-- translating them can change trigger precision
-- if localization must touch them, do it only with explicit user approval and a full rollback plan
-- prompt template files in `superpowers` are especially sensitive because they are reused to generate subagent task prompts
+- 这些字段通常会进入模型侧调度层
+- 翻译后可能改变触发精度
+- 如果必须改，需要用户明确允许，并保留完整回滚方案
 
-## Recommended Strategy
+## 推荐策略
 
-1. Keep trigger metadata in English.
-2. Add or update `agents/openai.yaml` as a UI shadow layer.
-3. Localize only `interface.short_description` first.
-4. Re-check the visible skill list in Codex.
-5. Expand to higher-risk fields only if the UI still reads from them and the user accepts the tradeoff.
+1. 默认不改模型调度字段。
+2. 先只汉化 `interface.short_description`。
+3. 插件缓存就地写入，不复制到 `~/.agents/skills`。
+4. 用 `verify` 和 `report` 检查覆盖、错漏和遮蔽关系。
+5. 如果历史运行创建了个人影子副本，用 `dedupe` 归档清理。
+6. 只有用户明确接受影响时，才扩展到高风险字段。

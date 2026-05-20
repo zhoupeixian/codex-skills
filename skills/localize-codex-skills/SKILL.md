@@ -1,161 +1,123 @@
 ---
 name: localize-codex-skills
-description: Safely extract, translate, apply, verify, and roll back Codex-visible skill metadata. Use when auditing which files back the skill descriptions shown in Codex, generating a batch translation pack for skills, applying Chinese UI descriptions with backups, or restoring the original metadata after a localization experiment. Prefer the low-risk UI shadow metadata in agents/openai.yaml and avoid rewriting SKILL.md descriptions unless the user explicitly accepts possible routing side effects.
+description: 用于扫描 Codex 可见的 skill，生成翻译包，就地应用中文描述，校验覆盖、生成审计报告、清理旧影子副本并一键回滚；适合处理 skill 列表、插件缓存、Superpowers 技能和提示词汉化。
 ---
 
-# Localize Codex Skills
+# localize-codex-skills
 
-## Overview
+## 核心目标
 
-Use this skill to localize Codex skill descriptions in a way that is fast, repeatable, reversible, and auditable.
+把 Codex 里能看到的 skill 描述翻成中文，并且让翻译结果在重启后还能保住。
 
-The default workflow is intentionally conservative:
+## 默认策略
 
-1. Extract the currently active skills into one translation pack.
-2. Include visible runtime shadow copies and prompt-role descriptions when needed.
-3. Translate the pack in one pass.
-4. Apply the translations to the correct visible surface.
-5. Verify coverage.
-6. Generate a strict bilingual audit report.
-7. Keep the generated rollback script for one-click restore.
+1. 先扫描当前 Codex 会读取的 skill 根目录，排除 `.codex/.tmp` 临时目录。
+2. 对当前可见 skill 按名称去重，并记录被同名更高优先级 skill 遮蔽的项。
+3. 对 `~/.agents/skills` 里的真实个人 skill，直接原地改。
+4. 对插件、Bundled、Superpowers 这类缓存来源，直接写回插件缓存里的 `agents/openai.yaml`，不要复制到 `~/.agents/skills`。
+5. 默认只改 `agents/openai.yaml.interface.short_description` 这一层。
+6. `SKILL.md` frontmatter `description`、提示词 frontmatter、`argument-hint` 是高风险字段，只有用户明确允许时才改。
+7. 如果历史流程已经在 `~/.agents/skills` 生成了插件影子副本，运行 `dedupe` 归档清理。
 
-This avoids touching `SKILL.md` `description` by default, which is the higher-risk field because it helps Codex decide when a skill should trigger.
+## 工作流
 
-## Safety Model
+### 1. 提取
 
-Read [references/safety-surfaces.md](references/safety-surfaces.md) before changing anything.
-
-Use these rules:
-
-- Default to UI-only localization.
-- Prefer `agents/openai.yaml` `interface.short_description` as the localized surface.
-- Preserve existing `display_name`, icons, colors, and other UI metadata.
-- Do not rewrite `SKILL.md` `description` unless the user explicitly asks for a higher-risk full rewrite.
-- Do not assume plugin cache hashes are stable. Always discover the active cache directories at runtime.
-
-## Workflow
-
-### 1. Extract active skill metadata
-
-Run:
+运行：
 
 ```powershell
 & "<node>" scripts/localize-codex-skills.mjs extract --out .\skill-ui-pack.json
 ```
 
-This scans:
+提取结果要包含：
 
-- `C:\Users\<user>\.codex\skills`
-- `C:\Users\<user>\.codex\superpowers\skills`
-- `C:\Users\<user>\.agents\skills`
-- active plugin cache roots under `.codex\plugins\cache`
-- runtime plugin shadows under `.codex\.tmp\plugins\plugins`
-- runtime bundled marketplace shadows under `.codex\.tmp\bundled-marketplaces`
-- prompt role descriptions under `.codex\prompts`
-- superpowers prompt templates ending in `-prompt.md`
+- 原始 skill 路径
+- 实际写入的目标根目录
+- 原文
+- 译文占位
+- 是否可见
+- 是否被同名 skill 遮蔽
 
-The output pack is a single JSON file. Each item includes:
+### 2. 翻译
 
-- source skill path
-- target file path
-- original English description to translate
-- empty `translation` field to fill
+只填 `translation` 字段，不改路径、ID、字段名和风险标记。
 
-This extracted pack is also the source of truth for the later audit report. Do not remove or reorder items unless you intentionally want a different audit scope.
+要求：
 
-For prompt roles, the target is the prompt markdown frontmatter `description`, not `agents/openai.yaml`.
-For superpowers prompt templates, scan and report both `description` and `argument-hint`, but only apply them when the user explicitly approves high-risk prompt rewrites with `--allow-high-risk`.
+- 保留原意
+- 技术名词、产品名、API 名称保持英文
+- 译文要短，适合在 UI 列表里快速扫读
 
-If you want to test on a small subset first, pass one or more custom roots:
+### 3. 应用
 
-```powershell
-& "<node>" scripts/localize-codex-skills.mjs extract --root C:\path\to\some\skills --out .\subset-pack.json
-```
-
-### 2. Translate the pack once
-
-Translate only the `translation` values in the JSON pack.
-
-Requirements:
-
-- Preserve meaning exactly.
-- Keep product names, APIs, and proper nouns in English when that improves clarity.
-- Do not change file paths, ids, or source text.
-- Keep the translation concise enough for UI scanning.
-
-### 3. Apply with backup and rollback generation
-
-Run:
+运行：
 
 ```powershell
 & "<node>" scripts/localize-codex-skills.mjs apply --pack .\skill-ui-pack.json
 ```
 
-This will:
+应用时要：
 
-- create or update `agents/openai.yaml`
-- update only low-risk UI metadata by default
-- back up every touched file
-- generate a backup manifest
-- generate `rollback.ps1`
+- 直接写入 pack 中的目标文件
+- 自动备份所有被改动的文件
+- 生成回滚脚本
 
-The script writes `interface.short_description` for skills by default. If a skill does not already have `agents/openai.yaml`, the script creates one with just that field.
+### 4. 校验
 
-Prompt-role items, Superpowers prompt templates, and `SKILL.md` `description` targets are high-risk. The script refuses to apply them unless `--allow-high-risk` is present after explicit user approval.
-
-### 4. Verify
-
-Run:
+运行：
 
 ```powershell
 & "<node>" scripts/localize-codex-skills.mjs verify --pack .\skill-ui-pack.json
 ```
 
-Verification reports:
+校验必须报告：
 
-- items applied successfully
-- items missing translations
-- items whose current file content does not match the translated pack
+- 已应用项
+- 缺失翻译项
+- 当前内容与翻译包不一致的项
+- 被同名 skill 遮蔽、因此未处理的项
 
-Treat mismatches as a failed rollout until resolved.
+### 5. 报表
 
-### 5. Generate the audit report
-
-Run:
+运行：
 
 ```powershell
 & "<node>" scripts/localize-codex-skills.mjs report --pack .\skill-ui-pack.json --out .\skill-ui-pack.audit.md
 ```
 
-This report is mandatory after every real run of the skill.
+审计报表必须保留：
 
-The report includes:
+- 全量扫描项
+- 原文 / 译文对照
+- 目标文件和目标根目录
+- 当前内容
+- 结果状态
+- 遮蔽关系
 
-- the complete scanned item inventory
-- source skill file and target UI file for every item
-- source field used for extraction
-- target field actually written
-- original text
-- translated Chinese text
-- current applied UI text
-- verification status and mismatch notes
+### 6. 回滚
 
-If you skip this report, the run is incomplete.
-
-### 6. Roll back
-
-Run the generated PowerShell script:
+运行生成的 PowerShell 脚本：
 
 ```powershell
 & .\backups\<timestamp>\rollback.ps1
 ```
 
-That restores original files and deletes any `agents/openai.yaml` files that were created only for the localization pass.
+它要恢复原文件，并删除这次新建的影子根目录。
 
-## Notes
+### 7. 清理旧影子副本
 
-- This skill is optimized for the Codex skill list UI problem.
-- It does not rewrite `SKILL.md` trigger descriptions or prompt-template metadata unless the user explicitly approves high-risk prompt rewrites.
-- If the user explicitly wants a broader rewrite, stop and call out the routing risk first.
-- Every completed run should leave behind three artifacts together: translation pack, audit report, and rollback script.
-- Runtime-visible English may come from shadow copies under `.codex\.tmp`; if the visible UI still shows English, inspect those before assuming the cache copy is authoritative.
+如果 Codex UI 出现大量来源为“个人”的插件 skill，运行：
+
+```powershell
+& "<node>" scripts/localize-codex-skills.mjs dedupe
+```
+
+它会把 `~/.agents/skills` 中与已启用插件同名的旧副本移动到备份目录，并生成回滚脚本。
+
+## 风险边界
+
+- 不要默认改 `SKILL.md` frontmatter `description`
+- 不要默认改提示词 frontmatter
+- 不要把写入落到 `.codex\.tmp`
+- 不要把插件 skill 复制到 `~\.agents\skills`
+- 如果用户明确要做高风险字段改写，先说明影响范围，再继续

@@ -8,10 +8,10 @@ import process from 'node:process';
 function usage() {
   console.log(`Usage:
   node scripts/localize-codex-skills.mjs extract --out <pack.json> [--root <skills-dir> ...]
-  node scripts/localize-codex-skills.mjs apply --pack <pack.json> [--backup-dir <dir>]
-  node scripts/localize-codex-skills.mjs apply --pack <pack.json> --allow-high-risk [--backup-dir <dir>]
+  node scripts/localize-codex-skills.mjs apply --pack <pack.json> [--backup-dir <dir>] [--allow-high-risk]
   node scripts/localize-codex-skills.mjs verify --pack <pack.json>
   node scripts/localize-codex-skills.mjs report --pack <pack.json> [--out <report.md>] [--verify]
+  node scripts/localize-codex-skills.mjs dedupe [--backup-dir <dir>]
 `);
 }
 
@@ -52,12 +52,59 @@ async function exists(target) {
   }
 }
 
-async function statOrNull(target) {
-  try {
-    return await fs.stat(target);
-  } catch {
-    return null;
+function requireUserProfile() {
+  const userProfile = process.env.USERPROFILE;
+  if (!userProfile) throw new Error('USERPROFILE is not set');
+  return userProfile;
+}
+
+function codexHome() {
+  return path.join(requireUserProfile(), '.codex');
+}
+
+function agentsSkillsRoot() {
+  return path.join(requireUserProfile(), '.agents', 'skills');
+}
+
+function normalizeForCompare(target) {
+  return path.resolve(target).replaceAll('\\', '/').toLowerCase();
+}
+
+function sourcePriority(skillFile) {
+  const normalized = normalizeForCompare(skillFile);
+  if (normalized.includes('/.agents/skills/')) return 500;
+  if (normalized.includes('/.codex/skills/')) return 400;
+  if (normalized.includes('/.codex/superpowers/skills/')) return 350;
+  if (normalized.includes('/.codex/plugins/cache/')) return 200;
+  if (normalized.includes('/.codex/.tmp/')) return 100;
+  return 50;
+}
+
+async function findSkillRoot(filePath) {
+  let current = path.dirname(filePath);
+  while (true) {
+    if (await exists(path.join(current, 'SKILL.md'))) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
   }
+}
+
+function isAgentsSkillRoot(skillRoot) {
+  return normalizeForCompare(skillRoot).includes('/.agents/skills/');
+}
+
+async function pluginShadowRoots(baseDir) {
+  if (!(await exists(baseDir))) return [];
+  const entries = await fs.readdir(baseDir, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(baseDir, entry.name, 'skills'));
+}
+
+function relativeFromRoot(root, filePath) {
+  const relative = path.relative(root, filePath);
+  return relative === '' ? path.basename(filePath) : relative;
 }
 
 function splitLines(content) {
@@ -87,6 +134,13 @@ function unquote(value) {
 
 function quote(value) {
   return JSON.stringify(value);
+}
+
+function escapeCell(value) {
+  return String(value ?? '')
+    .replace(/\r?\n/g, '<br>')
+    .replace(/\|/g, '\\|')
+    .trim();
 }
 
 function parseFrontmatter(content) {
@@ -162,62 +216,26 @@ function parseOpenAiYaml(content) {
   return result;
 }
 
-function parsePluginJson(content) {
-  try {
-    return JSON.parse(content);
-  } catch {
-    return null;
-  }
+function readPromptTargetField(content, fieldName) {
+  const frontmatter = parseFrontmatter(content);
+  if (!frontmatter) return null;
+  return readTopLevelField(frontmatter.frontmatterLines, fieldName);
 }
 
-function updatePluginJsonInterface(content, updates) {
-  const data = JSON.parse(content);
-  data.interface = data.interface || {};
-  for (const [key, value] of Object.entries(updates)) {
-    data.interface[key] = value;
-  }
-  return `${JSON.stringify(data, null, 2)}\n`;
-}
-
-function upsertTopLevelFieldInFrontmatter(content, fieldName, value) {
-  const parsed = parseFrontmatter(content);
-  if (!parsed) {
-    return `---\n${fieldName}: ${quote(value)}\n---\n${content}`;
-  }
-  const { frontmatterLines, bodyLines, newline } = parsed;
-  const prefix = `${fieldName}:`;
-  let replaced = false;
-  const updatedFrontmatter = [];
-
-  for (let i = 0; i < frontmatterLines.length; i += 1) {
-    const line = frontmatterLines[i];
-    if (!replaced && line.startsWith(prefix)) {
-      updatedFrontmatter.push(`${fieldName}: ${quote(value)}`);
-      replaced = true;
-
-      const raw = line.slice(prefix.length).trim();
-      if (raw.startsWith('|') || raw.startsWith('>')) {
-        i += 1;
-        while (i < frontmatterLines.length) {
-          const next = frontmatterLines[i];
-          if (next.startsWith(' ') || next === '') {
-            i += 1;
-            continue;
-          }
-          i -= 1;
-          break;
-        }
-      }
+function readPromptTemplateField(content, fieldName) {
+  const lines = splitLines(content);
+  let inCodeFence = false;
+  const prefix = `  ${fieldName}:`;
+  for (const line of lines) {
+    if (line.trim() === '```') {
+      inCodeFence = !inCodeFence;
       continue;
     }
-    updatedFrontmatter.push(line);
+    if (!inCodeFence) continue;
+    if (!line.startsWith(prefix)) continue;
+    return unquote(line.slice(prefix.length).trim());
   }
-
-  if (!replaced) {
-    updatedFrontmatter.push(`${fieldName}: ${quote(value)}`);
-  }
-
-  return ['---', ...updatedFrontmatter, '---', ...bodyLines].join(newline);
+  return null;
 }
 
 function upsertInterfaceField(content, fieldName, value) {
@@ -243,70 +261,78 @@ function upsertInterfaceField(content, fieldName, value) {
   return lines.join(newline);
 }
 
-function readPromptTemplateField(content, fieldName) {
-  const lines = splitLines(content);
+function upsertTopLevelFieldInFrontmatter(content, fieldName, value) {
+  const frontmatter = parseFrontmatter(content);
+  if (!frontmatter) return content;
+
+  const { frontmatterLines, bodyLines, newline } = frontmatter;
+  const replacement = `${fieldName}: ${quote(value)}`;
+  const updatedFrontmatterLines = [...frontmatterLines];
   const prefix = `${fieldName}:`;
-  let inCodeBlock = false;
-  let inPromptTool = false;
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    const trimmed = line.trim();
-    if (trimmed === '```') {
-      inCodeBlock = !inCodeBlock;
-      inPromptTool = false;
-      continue;
-    }
-    if (!inCodeBlock) continue;
-    if (/Task tool/i.test(line)) {
-      inPromptTool = true;
-      continue;
-    }
-    if (!inPromptTool) continue;
-    const body = line.trimStart();
-    if (body.startsWith(prefix)) {
-      return unquote(body.slice(prefix.length).trim());
-    }
+  let replaced = false;
+
+  for (let i = 0; i < updatedFrontmatterLines.length; i += 1) {
+    if (!updatedFrontmatterLines[i].startsWith(prefix)) continue;
+    updatedFrontmatterLines[i] = replacement;
+    replaced = true;
+    break;
   }
-  return null;
+
+  if (!replaced) {
+    updatedFrontmatterLines.push(replacement);
+  }
+
+  return ['---', ...updatedFrontmatterLines, '---', ...bodyLines].join(newline);
 }
 
 function upsertPromptTemplateField(content, fieldName, value) {
   const newline = detectNewline(content);
   const lines = splitLines(content);
   const replacement = `  ${fieldName}: ${quote(value)}`;
-  let inCodeBlock = false;
-  let inPromptTool = false;
-  let toolStart = -1;
-  let toolEnd = -1;
+  let inCodeFence = false;
+  let fieldIndex = -1;
+  let insertBeforeIndex = -1;
+
   for (let i = 0; i < lines.length; i += 1) {
-    const trimmed = lines[i].trim();
-    if (trimmed === '```') {
-      inCodeBlock = !inCodeBlock;
-      if (!inCodeBlock && inPromptTool && toolEnd === -1) {
-        toolEnd = i;
+    const line = lines[i];
+    if (line.trim() === '```') {
+      if (!inCodeFence) {
+        inCodeFence = true;
+        continue;
       }
-      continue;
+      break;
     }
-    if (!inCodeBlock) continue;
-    if (/Task tool/i.test(lines[i])) {
-      inPromptTool = true;
-      toolStart = i;
-      continue;
+    if (!inCodeFence) continue;
+    if (line.startsWith(`  ${fieldName}:`)) {
+      fieldIndex = i;
+      break;
     }
-    if (!inPromptTool) continue;
-    const body = lines[i].trimStart();
-    if (body.startsWith(`${fieldName}:`)) {
-      lines[i] = replacement;
-      return lines.join(newline);
+    if (insertBeforeIndex === -1 && line.startsWith('  prompt:')) {
+      insertBeforeIndex = i;
     }
   }
-  if (toolStart === -1 || toolEnd === -1) return content;
-  lines.splice(toolEnd, 0, replacement);
+
+  if (fieldIndex !== -1) {
+    lines[fieldIndex] = replacement;
+    return lines.join(newline);
+  }
+
+  if (insertBeforeIndex === -1) {
+    return content;
+  }
+
+  lines.splice(insertBeforeIndex, 0, replacement);
   return lines.join(newline);
 }
 
 async function walk(dir, visitor) {
-  const entries = await fs.readdir(dir, { withFileTypes: true });
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    console.warn(`跳过不可读目录: ${dir} (${error.message})`);
+    return;
+  }
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
@@ -319,14 +345,26 @@ async function walk(dir, visitor) {
 
 async function newestChildDirs(baseDir) {
   if (!(await exists(baseDir))) return [];
-  const entries = await fs.readdir(baseDir, { withFileTypes: true });
+  let entries;
+  try {
+    entries = await fs.readdir(baseDir, { withFileTypes: true });
+  } catch (error) {
+    console.warn(`跳过不可读目录: ${baseDir} (${error.message})`);
+    return [];
+  }
   const roots = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const parent = path.join(baseDir, entry.name);
-    const children = (await fs.readdir(parent, { withFileTypes: true }))
-      .filter((child) => child.isDirectory())
-      .map((child) => path.join(parent, child.name));
+    let children;
+    try {
+      children = (await fs.readdir(parent, { withFileTypes: true }))
+        .filter((child) => child.isDirectory())
+        .map((child) => path.join(parent, child.name));
+    } catch (error) {
+      console.warn(`跳过不可读目录: ${parent} (${error.message})`);
+      continue;
+    }
     if (!children.length) {
       roots.push(parent);
       continue;
@@ -344,273 +382,311 @@ async function newestChildDirs(baseDir) {
 
 async function bundledRoots(baseDir) {
   if (!(await exists(baseDir))) return [];
-  const entries = await fs.readdir(baseDir, { withFileTypes: true });
+  let entries;
+  try {
+    entries = await fs.readdir(baseDir, { withFileTypes: true });
+  } catch (error) {
+    console.warn(`跳过不可读目录: ${baseDir} (${error.message})`);
+    return [];
+  }
   return entries.filter((entry) => entry.isDirectory()).map((entry) => path.join(baseDir, entry.name));
 }
 
-async function pluginShadowRoots(baseDir) {
-  if (!(await exists(baseDir))) return [];
-  const entries = await fs.readdir(baseDir, { withFileTypes: true });
-  return entries.filter((entry) => entry.isDirectory()).map((entry) => path.join(baseDir, entry.name, 'skills'));
+async function collectChildRoots(baseDir) {
+  return newestChildDirs(baseDir);
 }
 
 function classifySource(skillFile) {
-  const normalized = skillFile.toLowerCase();
-  if (normalized.includes('\\.codex\\.tmp\\plugins\\plugins\\')) return 'plugin-runtime-shadow';
-  if (normalized.includes('\\.codex\\.tmp\\bundled-marketplaces\\')) return 'plugin-bundled-shadow';
-  if (normalized.includes('\\.codex\\plugins\\cache\\openai-curated\\')) return 'plugin-curated';
-  if (normalized.includes('\\.codex\\plugins\\cache\\openai-primary-runtime\\')) return 'plugin-runtime';
-  if (normalized.includes('\\.codex\\plugins\\cache\\openai-bundled\\')) return 'plugin-bundled';
-  if (normalized.includes('\\.codex\\superpowers\\skills\\')) return 'plugin-user-overlay';
-  if (normalized.includes('\\.agents\\skills\\')) return 'agent-skill';
-  return 'user-skill';
+  const normalized = normalizeForCompare(skillFile);
+  if (normalized.includes('/.agents/skills/')) return 'personal-skill';
+  if (normalized.includes('/.codex/skills/')) return 'codex-skill';
+  if (normalized.includes('/.codex/superpowers/skills/')) return 'superpowers-skill';
+  if (normalized.includes('/.codex/plugins/cache/openai-curated/')) return 'plugin-curated';
+  if (normalized.includes('/.codex/plugins/cache/openai-primary-runtime/')) return 'plugin-runtime';
+  if (normalized.includes('/.codex/plugins/cache/openai-bundled/')) return 'plugin-bundled';
+  if (normalized.includes('/.codex/.tmp/')) return 'runtime-shadow';
+  return 'other';
 }
 
-function packItemId(skillFile) {
-  return `skill-ui::${skillFile}`;
+function packItemId(kind, key, sourceFile) {
+  return `${kind}::${key}::${normalizeForCompare(sourceFile)}`;
 }
 
-function uiPackItemId(uiFile) {
-  return `skill-ui-shadow::${uiFile}`;
-}
-
-function classifyPromptSource(promptFile) {
-  const normalized = promptFile.toLowerCase();
-  if (normalized.includes('\\.codex\\superpowers\\skills\\')) return 'prompt-template';
-  if (normalized.includes('\\.codex\\.tmp\\plugins\\plugins\\superpowers\\skills\\')) return 'prompt-template-shadow';
-  if (normalized.includes('\\.codex\\plugins\\cache\\openai-curated\\superpowers\\')) return 'prompt-template-curated';
-  if (normalized.includes('\\.codex\\prompts\\')) return 'prompt-role';
-  return 'prompt';
-}
-
-function promptPackItemId(promptFile) {
-  return `prompt-ui::${promptFile}`;
-}
-
-async function discoverSkillFiles(customRoots) {
-  if (customRoots.length) {
-    const discovered = [];
-    for (const root of customRoots) {
-      if (!(await exists(root))) continue;
-      await walk(root, async (file) => {
-        if (path.basename(file) === 'SKILL.md') discovered.push(file);
-      });
-    }
-    return discovered.sort((a, b) => a.localeCompare(b));
-  }
-
-  const userProfile = process.env.USERPROFILE;
-  if (!userProfile) throw new Error('USERPROFILE is not set');
-  const codexHome = path.join(userProfile, '.codex');
-  const agentsHome = path.join(userProfile, '.agents');
-  const defaultRoots = [
-    path.join(codexHome, 'skills'),
-    path.join(codexHome, 'superpowers', 'skills'),
-    path.join(agentsHome, 'skills'),
-    ...(await newestChildDirs(path.join(codexHome, 'plugins', 'cache', 'openai-curated'))),
-    ...(await newestChildDirs(path.join(codexHome, 'plugins', 'cache', 'openai-primary-runtime'))),
-    ...(await bundledRoots(path.join(codexHome, 'plugins', 'cache', 'openai-bundled'))),
-    ...(await pluginShadowRoots(path.join(codexHome, '.tmp', 'plugins', 'plugins'))),
-    ...(await pluginShadowRoots(path.join(codexHome, '.tmp', 'bundled-marketplaces', 'openai-bundled', 'plugins'))),
+async function defaultSkillRoots() {
+  const codex = codexHome();
+  return [
+    path.join(codex, 'skills'),
+    agentsSkillsRoot(),
+    path.join(codex, 'superpowers', 'skills'),
+    ...(await collectChildRoots(path.join(codex, 'plugins', 'cache', 'openai-curated'))),
+    ...(await collectChildRoots(path.join(codex, 'plugins', 'cache', 'openai-primary-runtime'))),
+    ...(await collectChildRoots(path.join(codex, 'plugins', 'cache', 'openai-bundled'))),
   ];
+}
 
-  const dedupedRoots = [...new Set(defaultRoots)];
-  const discovered = [];
-  for (const root of dedupedRoots) {
+async function collectSkillCandidates(customRoots) {
+  const roots = customRoots.length ? customRoots : await defaultSkillRoots();
+  const duplicateAgentNames = customRoots.length ? new Set() : await pluginSkillNames();
+  const files = [];
+  for (const root of roots) {
     if (!(await exists(root))) continue;
+    if (normalizeForCompare(root).includes('/.codex/.tmp/')) continue;
     await walk(root, async (file) => {
-      if (path.basename(file) === 'SKILL.md') discovered.push(file);
+      if (path.basename(file) === 'SKILL.md') files.push(file);
     });
   }
-  return discovered.sort((a, b) => a.localeCompare(b));
-}
-
-async function discoverPromptFiles() {
-  const userProfile = process.env.USERPROFILE;
-  if (!userProfile) throw new Error('USERPROFILE is not set');
-  const promptsDir = path.join(userProfile, '.codex', 'prompts');
-  if (!(await exists(promptsDir))) return [];
-  const entries = await fs.readdir(promptsDir, { withFileTypes: true });
-  return entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
-    .map((entry) => path.join(promptsDir, entry.name))
-    .sort((a, b) => a.localeCompare(b));
-}
-
-async function discoverPromptTemplateFiles() {
-  const userProfile = process.env.USERPROFILE;
-  if (!userProfile) throw new Error('USERPROFILE is not set');
-  const codexHome = path.join(userProfile, '.codex');
-  const defaultRoots = [
-    path.join(codexHome, 'superpowers', 'skills'),
-    ...(await newestChildDirs(path.join(codexHome, 'plugins', 'cache', 'openai-curated', 'superpowers'))),
-    path.join(codexHome, '.tmp', 'plugins', 'plugins', 'superpowers', 'skills'),
-  ];
-
-  const dedupedRoots = [...new Set(defaultRoots)];
-  const discovered = [];
-  for (const root of dedupedRoots) {
-    if (!(await exists(root))) continue;
-    await walk(root, async (file) => {
-      if (path.basename(file).endsWith('-prompt.md')) discovered.push(file);
-    });
-  }
-  return discovered.sort((a, b) => a.localeCompare(b));
-}
-
-function resolveSkillTarget(skillFile, uiFile) {
-  const normalized = skillFile.toLowerCase();
-
-  if (normalized.includes('\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\')) {
-    const pluginRoot = skillFile.slice(0, normalized.indexOf('\\skills\\'));
-    const pluginJson = path.join(pluginRoot, '.codex-plugin', 'plugin.json');
-    return {
-      targetFile: pluginJson,
-      targetField: 'plugin.json.interface.longDescription',
-      displayField: 'plugin.json.interface.longDescription',
-    };
-  }
-
-  return {
-    targetFile: uiFile,
-    targetField: 'agents/openai.yaml.interface.short_description',
-    displayField: 'agents/openai.yaml.interface.short_description',
-  };
-}
-
-async function buildPack(customRoots) {
-  const skillFiles = await discoverSkillFiles(customRoots);
-  const items = [];
-  for (const skillFile of skillFiles) {
+  const deduped = [...new Set(files)].sort((a, b) => a.localeCompare(b));
+  const candidates = [];
+  for (const skillFile of deduped) {
     const raw = await fs.readFile(skillFile, 'utf8');
     const frontmatter = parseFrontmatter(raw);
     if (!frontmatter) continue;
     const name = readTopLevelField(frontmatter.frontmatterLines, 'name');
     const description = readTopLevelField(frontmatter.frontmatterLines, 'description');
     if (!name || !description) continue;
-    const shortFromMetadata = readNestedField(frontmatter.frontmatterLines, 'metadata', 'short-description');
-    const skillDir = path.dirname(skillFile);
-    const uiFile = path.join(skillDir, 'agents', 'openai.yaml');
-    const target = resolveSkillTarget(skillFile, uiFile);
-    let currentUi = null;
-    if (await exists(uiFile)) {
-      currentUi = parseOpenAiYaml(await fs.readFile(uiFile, 'utf8'));
+    const skillRoot = path.dirname(skillFile);
+    if (isAgentsSkillRoot(skillRoot) && duplicateAgentNames.has(name)) continue;
+    const targetRoot = skillRoot;
+    const targetFile = path.join(targetRoot, 'agents', 'openai.yaml');
+    let original = description;
+    if (await exists(targetFile)) {
+      const current = parseOpenAiYaml(await fs.readFile(targetFile, 'utf8')).short_description;
+      if (current) original = current;
     }
-    let visibleCurrent = null;
-    if (target.targetFile && await exists(target.targetFile)) {
-      const targetRaw = await fs.readFile(target.targetFile, 'utf8');
-      if (target.targetField === 'plugin.json.interface.longDescription') {
-        visibleCurrent = parsePluginJson(targetRaw)?.interface?.longDescription ?? null;
-      } else if (target.targetField === 'SKILL.md.description') {
-        const parsed = parseFrontmatter(targetRaw);
-        visibleCurrent = parsed ? readTopLevelField(parsed.frontmatterLines, 'description') : null;
-      } else {
-        visibleCurrent = parseOpenAiYaml(targetRaw).short_description ?? null;
-      }
-    }
-    items.push({
-      id: packItemId(skillFile),
+    candidates.push({
+      kind: 'skill',
+      logicalKey: `skill::${name}`,
+      id: packItemId('skill', name, skillFile),
       name,
       sourceFamily: classifySource(skillFile),
+      sourcePriority: sourcePriority(skillFile),
       skillFile,
-      uiFile,
-      targetFile: target.targetFile,
-      sourceField: visibleCurrent
-        ? target.displayField
-        : currentUi?.short_description
-        ? 'agents/openai.yaml.interface.short_description'
-        : shortFromMetadata
-          ? 'SKILL.md.metadata.short-description'
-          : 'SKILL.md.description',
-      targetField: target.targetField,
-      original: visibleCurrent || currentUi?.short_description || shortFromMetadata || description,
+      skillRoot,
+      targetRoot,
+      targetFile,
+      sourceField: 'SKILL.md.description',
+      targetField: 'agents/openai.yaml.interface.short_description',
+      original,
       translation: '',
       risk: 'low',
+      visible: false,
+      shadowedBy: null,
+      shadowTarget: false,
     });
-
-    if (
-      target.targetField === 'plugin.json.interface.longDescription' &&
-      currentUi?.short_description
-    ) {
-      items.push({
-        id: uiPackItemId(uiFile),
-        name,
-        sourceFamily: classifySource(skillFile),
-        skillFile,
-        uiFile,
-        targetFile: uiFile,
-        sourceField: 'agents/openai.yaml.interface.short_description',
-        targetField: 'agents/openai.yaml.interface.short_description',
-        original: currentUi.short_description,
-        translation: '',
-        risk: 'low',
-      });
-    }
   }
+  return candidates;
+}
 
-  const promptFiles = await discoverPromptFiles();
-  for (const promptFile of promptFiles) {
+function selectVisibleCandidates(candidates) {
+  const byKey = new Map();
+  const visible = [];
+  const shadowed = [];
+  const sorted = [...candidates].sort(
+    (a, b) =>
+      b.sourcePriority - a.sourcePriority ||
+      a.logicalKey.localeCompare(b.logicalKey) ||
+      a.skillFile.localeCompare(b.skillFile),
+  );
+  for (const candidate of sorted) {
+    const winner = byKey.get(candidate.logicalKey);
+    if (!winner) {
+      const visibleCandidate = { ...candidate, visible: true };
+      byKey.set(candidate.logicalKey, visibleCandidate);
+      visible.push(visibleCandidate);
+      continue;
+    }
+    shadowed.push({
+      ...candidate,
+      visible: false,
+      shadowedBy: winner.skillFile,
+    });
+  }
+  visible.sort((a, b) => a.name.localeCompare(b.name) || a.skillFile.localeCompare(b.skillFile));
+  shadowed.sort((a, b) => a.name.localeCompare(b.name) || a.skillFile.localeCompare(b.skillFile));
+  return { visible, shadowed };
+}
+
+async function collectPromptRoleCandidates() {
+  const promptsDir = path.join(codexHome(), 'prompts');
+  if (!(await exists(promptsDir))) return [];
+  const entries = await fs.readdir(promptsDir, { withFileTypes: true });
+  const files = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
+    .map((entry) => path.join(promptsDir, entry.name))
+    .sort((a, b) => a.localeCompare(b));
+  const items = [];
+  for (const promptFile of files) {
     const raw = await fs.readFile(promptFile, 'utf8');
     const frontmatter = parseFrontmatter(raw);
     if (!frontmatter) continue;
     const description = readTopLevelField(frontmatter.frontmatterLines, 'description');
     if (!description) continue;
+    let original = description;
+    if (await exists(promptFile)) {
+      const current = readPromptTargetField(await fs.readFile(promptFile, 'utf8'), 'description');
+      if (current) original = current;
+    }
     items.push({
-      id: promptPackItemId(promptFile),
+      kind: 'prompt-role',
+      logicalKey: `prompt-role::${normalizeForCompare(promptFile)}`,
+      id: packItemId('prompt-role', path.basename(promptFile, '.md'), promptFile),
       name: `prompts:${path.basename(promptFile, '.md')}`,
-      sourceFamily: classifyPromptSource(promptFile),
+      sourceFamily: 'prompt-role',
+      sourcePriority: 300,
       skillFile: promptFile,
-      uiFile: promptFile,
+      skillRoot: path.dirname(promptFile),
+      targetRoot: path.dirname(promptFile),
       targetFile: promptFile,
       sourceField: 'prompt.frontmatter.description',
       targetField: 'prompt.frontmatter.description',
-      original: description,
+      original,
       translation: '',
       risk: 'high',
+      visible: true,
+      shadowedBy: null,
+      shadowTarget: false,
     });
   }
+  return items;
+}
 
-  const promptTemplateFiles = await discoverPromptTemplateFiles();
-  for (const promptFile of promptTemplateFiles) {
-    const raw = await fs.readFile(promptFile, 'utf8');
-    const description = readPromptTemplateField(raw, 'description');
-    if (!description) continue;
-    const argumentHint = readPromptTemplateField(raw, 'argument-hint');
-    items.push({
-      id: `${promptPackItemId(promptFile)}::task-description`,
-      name: path.basename(promptFile, '.md'),
-      sourceFamily: classifyPromptSource(promptFile),
-      skillFile: promptFile,
-      uiFile: promptFile,
-      targetFile: promptFile,
-      sourceField: 'prompt-template.task.description',
-      targetField: 'prompt-template.task.description',
-      original: description,
-      translation: '',
-      risk: 'high',
+async function collectPromptTemplateCandidates(visibleSkills) {
+  const items = [];
+  for (const skill of visibleSkills) {
+    if (!(await exists(skill.skillRoot))) continue;
+    await walk(skill.skillRoot, async (file) => {
+      if (path.basename(file).endsWith('-prompt.md')) {
+        const raw = await fs.readFile(file, 'utf8');
+        const relativePath = path.relative(skill.skillRoot, file);
+        const targetRoot = skill.shadowTarget ? skill.targetRoot : skill.skillRoot;
+        const targetFile = path.join(targetRoot, relativePath);
+        const base = {
+          kind: 'prompt-template',
+          name: path.basename(file, '.md'),
+          sourceFamily: skill.sourceFamily,
+          sourcePriority: skill.sourcePriority,
+          skillFile: file,
+          skillRoot: skill.skillRoot,
+          targetRoot,
+          targetFile,
+          visible: true,
+          shadowedBy: null,
+          shadowTarget: skill.shadowTarget,
+        };
+        const description = readPromptTemplateField(raw, 'description');
+        let currentDescription = description;
+        if (await exists(targetFile)) {
+          const current = readPromptTargetField(await fs.readFile(targetFile, 'utf8'), 'description');
+          if (current) currentDescription = current;
+        }
+        if (description) {
+          items.push({
+            ...base,
+            logicalKey: `prompt-template::${skill.name}::${normalizeForCompare(relativePath)}::description`,
+            id: packItemId('prompt-template', `${skill.name}:${relativePath}:description`, file),
+            sourceField: 'prompt-template.task.description',
+            targetField: 'prompt-template.task.description',
+            original: currentDescription,
+            translation: '',
+            risk: 'high',
+          });
+        }
+        const argumentHint = readPromptTemplateField(raw, 'argument-hint');
+        let currentArgumentHint = argumentHint;
+        if (await exists(targetFile)) {
+          const current = readPromptTargetField(await fs.readFile(targetFile, 'utf8'), 'argument-hint');
+          if (current) currentArgumentHint = current;
+        }
+        if (argumentHint) {
+          items.push({
+            ...base,
+            logicalKey: `prompt-template::${skill.name}::${normalizeForCompare(relativePath)}::argument-hint`,
+            id: packItemId('prompt-template', `${skill.name}:${relativePath}:argument-hint`, file),
+            sourceField: 'prompt-template.task.argument-hint',
+            targetField: 'prompt-template.task.argument-hint',
+            original: currentArgumentHint,
+            translation: '',
+            risk: 'high',
+          });
+        }
+      }
     });
-    if (argumentHint) {
-      items.push({
-        id: `${promptPackItemId(promptFile)}::task-argument-hint`,
-        name: path.basename(promptFile, '.md'),
-        sourceFamily: classifyPromptSource(promptFile),
-        skillFile: promptFile,
-        uiFile: promptFile,
-        targetFile: promptFile,
-        sourceField: 'prompt-template.task.argument-hint',
-        targetField: 'prompt-template.task.argument-hint',
-        original: argumentHint,
-        translation: '',
-        risk: 'high',
-      });
-    }
   }
+  return items;
+}
+
+async function buildPack(customRoots) {
+  const rawSkills = await collectSkillCandidates(customRoots);
+  const { visible: visibleSkills, shadowed: shadowedSkills } = selectVisibleCandidates(rawSkills);
+  const promptRoles = await collectPromptRoleCandidates();
+  const promptTemplates = await collectPromptTemplateCandidates(visibleSkills);
+  const items = [...visibleSkills, ...promptRoles, ...promptTemplates].sort(
+    (a, b) =>
+      a.name.localeCompare(b.name) ||
+      a.kind.localeCompare(b.kind) ||
+      a.targetField.localeCompare(b.targetField) ||
+      a.skillFile.localeCompare(b.skillFile),
+  );
+  const shadowedItems = shadowedSkills.sort(
+    (a, b) => a.name.localeCompare(b.name) || a.skillFile.localeCompare(b.skillFile),
+  );
   return {
     generatedAt: new Date().toISOString(),
-    strategy: 'ui-shadow-plus-prompt-audit',
+    strategy: 'in-place-plugin-cache-plus-audit',
     itemCount: items.length,
+    shadowedCount: shadowedItems.length,
     items,
+    shadowedItems,
   };
+}
+
+async function pluginSkillNames() {
+  const codex = codexHome();
+  const roots = [
+    path.join(codex, 'superpowers', 'skills'),
+    ...(await collectChildRoots(path.join(codex, 'plugins', 'cache', 'openai-curated'))),
+    ...(await collectChildRoots(path.join(codex, 'plugins', 'cache', 'openai-primary-runtime'))),
+    ...(await collectChildRoots(path.join(codex, 'plugins', 'cache', 'openai-bundled'))),
+  ];
+  const names = new Set();
+  for (const root of roots) {
+    if (!(await exists(root))) continue;
+    await walk(root, async (file) => {
+      if (path.basename(file) !== 'SKILL.md') return;
+      const raw = await fs.readFile(file, 'utf8');
+      const frontmatter = parseFrontmatter(raw);
+      if (!frontmatter) return;
+      const name = readTopLevelField(frontmatter.frontmatterLines, 'name');
+      if (name) names.add(name);
+    });
+  }
+  return names;
+}
+
+async function agentSkillName(skillRoot) {
+  const skillFile = path.join(skillRoot, 'SKILL.md');
+  if (!(await exists(skillFile))) return null;
+  const raw = await fs.readFile(skillFile, 'utf8');
+  const frontmatter = parseFrontmatter(raw);
+  if (!frontmatter) return null;
+  return readTopLevelField(frontmatter.frontmatterLines, 'name');
+}
+
+async function findDuplicateAgentSkillRoots() {
+  const pluginNames = await pluginSkillNames();
+  const root = agentsSkillsRoot();
+  if (!(await exists(root))) return [];
+  const entries = await fs.readdir(root, { withFileTypes: true });
+  const duplicates = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const skillRoot = path.join(root, entry.name);
+    const name = await agentSkillName(skillRoot);
+    if (!name || !pluginNames.has(name)) continue;
+    duplicates.push({ name, path: skillRoot });
+  }
+  duplicates.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return duplicates;
 }
 
 async function writeJson(file, value) {
@@ -621,6 +697,26 @@ async function writeJson(file, value) {
 async function writeText(file, value) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, value, 'utf8');
+}
+
+async function readSkillPack(packPath) {
+  const pack = JSON.parse(await fs.readFile(packPath, 'utf8'));
+  if (!pack || !Array.isArray(pack.items)) {
+    throw new Error('Invalid pack: missing items array');
+  }
+  return pack;
+}
+
+function translateValue(item) {
+  return typeof item.translation === 'string' ? item.translation.trim() : '';
+}
+
+function isHighRisk(item) {
+  return (
+    item.risk === 'high' ||
+    item.kind === 'prompt-role' ||
+    item.kind === 'prompt-template'
+  );
 }
 
 async function extractCommand(options) {
@@ -636,6 +732,12 @@ function buildBackupFolder(packPath, explicitBackupDir) {
   return path.join(path.dirname(path.resolve(packPath)), 'backups', stamp);
 }
 
+function buildDedupeBackupFolder(explicitBackupDir) {
+  if (explicitBackupDir) return path.resolve(explicitBackupDir);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return path.join(process.cwd(), 'description-restore-audit', 'dedupe-backups', stamp);
+}
+
 async function createRollbackArtifacts(backupDir, manifest) {
   const manifestPath = path.join(backupDir, 'manifest.json');
   await writeJson(manifestPath, manifest);
@@ -643,6 +745,13 @@ async function createRollbackArtifacts(backupDir, manifest) {
 
 $manifestPath = Join-Path $PSScriptRoot 'manifest.json'
 $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+
+function Remove-TreeIfExists([string]$PathValue) {
+  if (Test-Path -LiteralPath $PathValue) {
+    Remove-Item -LiteralPath $PathValue -Recurse -Force
+    Write-Host "Removed $PathValue"
+  }
+}
 
 foreach ($entry in $manifest.files) {
   $target = $entry.path
@@ -656,11 +765,12 @@ foreach ($entry in $manifest.files) {
     [System.IO.File]::WriteAllText($target, $content, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "Restored $target"
   } else {
-    if (Test-Path -LiteralPath $target) {
-      Remove-Item -LiteralPath $target -Force
-      Write-Host "Removed $target"
-    }
+    Remove-TreeIfExists $target
   }
+}
+
+foreach ($shadow in $manifest.shadowRoots) {
+  Remove-TreeIfExists $shadow
 }
 `;
   await fs.writeFile(path.join(backupDir, 'rollback.ps1'), rollbackScript, 'utf8');
@@ -669,15 +779,13 @@ foreach ($entry in $manifest.files) {
 async function applyCommand(options) {
   if (!options.pack) throw new Error('apply requires --pack');
   const packPath = path.resolve(options.pack);
-  const pack = JSON.parse(await fs.readFile(packPath, 'utf8'));
-  const actionable = pack.items.filter(
-    (item) => typeof item.translation === 'string' && item.translation.trim().length > 0,
-  );
+  const pack = await readSkillPack(packPath);
+  const actionable = pack.items.filter((item) => translateValue(item).length > 0);
   if (!actionable.length) {
     console.log('No translated items to apply.');
     return;
   }
-  const highRisk = actionable.filter((item) => item.risk === 'high');
+  const highRisk = actionable.filter((item) => isHighRisk(item));
   if (highRisk.length && !options['allow-high-risk']) {
     throw new Error(`High-risk items present (${highRisk.length}). Re-run with --allow-high-risk after explicit approval.`);
   }
@@ -687,16 +795,18 @@ async function applyCommand(options) {
   await fs.mkdir(filesDir, { recursive: true });
 
   const fileState = new Map();
+  const writes = new Map();
+
   for (const item of actionable) {
-    const targetFile = item.targetFile || item.uiFile;
-    if (fileState.has(targetFile)) continue;
-    const existed = await exists(targetFile);
-    const content = existed ? await fs.readFile(targetFile, 'utf8') : '';
-    fileState.set(targetFile, { existed, content });
+    if (!writes.has(item.targetFile)) {
+      const existed = await exists(item.targetFile);
+      const content = existed ? await fs.readFile(item.targetFile, 'utf8') : '';
+      writes.set(item.targetFile, { existed, content });
+    }
   }
 
   const manifestFiles = [];
-  for (const [targetFile, state] of fileState.entries()) {
+  for (const [targetFile, state] of writes.entries()) {
     const hash = crypto.createHash('sha1').update(targetFile).digest('hex');
     const backupRelativePath = path.join('files', `${hash}.txt`);
     const backupAbsolutePath = path.join(backupDir, backupRelativePath);
@@ -710,33 +820,26 @@ async function applyCommand(options) {
 
   const grouped = new Map();
   for (const item of actionable) {
-    const targetFile = item.targetFile || item.uiFile;
-    if (!grouped.has(targetFile)) grouped.set(targetFile, []);
-    grouped.get(targetFile).push(item);
+    if (!grouped.has(item.targetFile)) grouped.set(item.targetFile, []);
+    grouped.get(item.targetFile).push(item);
   }
 
   let changedFiles = 0;
   for (const [targetFile, items] of grouped.entries()) {
-    const state = fileState.get(targetFile);
+    const state = writes.get(targetFile);
     let updated = state.content;
     for (const item of items) {
-      if (item.targetField === 'prompt.frontmatter.description') {
-        updated = upsertTopLevelFieldInFrontmatter(updated, 'description', item.translation.trim());
-      } else if (item.targetField === 'prompt.frontmatter.argument-hint') {
-        updated = upsertTopLevelFieldInFrontmatter(updated, 'argument-hint', item.translation.trim());
-      } else if (item.targetField === 'prompt-template.task.description') {
-        updated = upsertPromptTemplateField(updated, 'description', item.translation.trim());
-      } else if (item.targetField === 'prompt-template.task.argument-hint') {
-        updated = upsertPromptTemplateField(updated, 'argument-hint', item.translation.trim());
-      } else if (item.targetField === 'SKILL.md.description') {
-        updated = upsertTopLevelFieldInFrontmatter(updated, 'description', item.translation.trim());
-      } else if (item.targetField === 'plugin.json.interface.longDescription') {
-        updated = updatePluginJsonInterface(updated, {
-          longDescription: item.translation.trim(),
-          shortDescription: item.translation.trim(),
-        });
-      } else {
-        updated = upsertInterfaceField(updated, 'short_description', item.translation.trim());
+      const translation = translateValue(item);
+      if (item.kind === 'skill') {
+        updated = upsertInterfaceField(updated, 'short_description', translation);
+      } else if (item.sourceField === 'prompt.frontmatter.description') {
+        updated = upsertTopLevelFieldInFrontmatter(updated, 'description', translation);
+      } else if (item.sourceField === 'prompt.frontmatter.argument-hint') {
+        updated = upsertTopLevelFieldInFrontmatter(updated, 'argument-hint', translation);
+      } else if (item.sourceField === 'prompt-template.task.description') {
+        updated = upsertPromptTemplateField(updated, 'description', translation);
+      } else if (item.sourceField === 'prompt-template.task.argument-hint') {
+        updated = upsertPromptTemplateField(updated, 'argument-hint', translation);
       }
     }
     if (updated !== state.content) {
@@ -750,6 +853,7 @@ async function applyCommand(options) {
     createdAt: new Date().toISOString(),
     packPath,
     files: manifestFiles,
+    shadowRoots: [],
   });
 
   console.log(`Applied ${actionable.length} translations across ${changedFiles} files.`);
@@ -757,14 +861,65 @@ async function applyCommand(options) {
   console.log(`Rollback: ${path.join(backupDir, 'rollback.ps1')}`);
 }
 
+async function dedupeCommand(options) {
+  const duplicates = await findDuplicateAgentSkillRoots();
+  const backupDir = buildDedupeBackupFolder(options['backup-dir']);
+  const movedDir = path.join(backupDir, 'agents-skills');
+  await fs.mkdir(movedDir, { recursive: true });
+
+  const moved = [];
+  for (const duplicate of duplicates) {
+    const destination = path.join(movedDir, path.basename(duplicate.path));
+    if (await exists(destination)) {
+      throw new Error(`Backup destination already exists: ${destination}`);
+    }
+    await fs.rename(duplicate.path, destination);
+    moved.push({
+      name: duplicate.name,
+      originalPath: duplicate.path,
+      backupPath: destination,
+    });
+  }
+
+  const manifest = {
+    createdAt: new Date().toISOString(),
+    reason: 'Moved .agents skills that duplicate enabled plugin skills.',
+    moved,
+  };
+  await writeJson(path.join(backupDir, 'manifest.json'), manifest);
+  const rollbackScript = `param()
+
+$manifestPath = Join-Path $PSScriptRoot 'manifest.json'
+$manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+
+foreach ($entry in $manifest.moved) {
+  $source = $entry.backupPath
+  $target = $entry.originalPath
+  if (Test-Path -LiteralPath $source) {
+    $parent = Split-Path -Parent $target
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+      New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    Move-Item -LiteralPath $source -Destination $target -Force
+    Write-Host "Restored $target"
+  }
+}
+`;
+  await writeText(path.join(backupDir, 'rollback.ps1'), rollbackScript);
+  console.log(`Moved duplicate .agents skills: ${moved.length}`);
+  console.log(`Backup: ${backupDir}`);
+  console.log(`Rollback: ${path.join(backupDir, 'rollback.ps1')}`);
+}
+
 async function verifyCommand(options) {
   if (!options.pack) throw new Error('verify requires --pack');
-  const pack = JSON.parse(await fs.readFile(path.resolve(options.pack), 'utf8'));
+  const pack = await readSkillPack(path.resolve(options.pack));
   const result = await verifyPack(pack);
 
   console.log(`Verified: ${result.ok}`);
   console.log(`Missing translations: ${result.missingTranslation}`);
   console.log(`Mismatches: ${result.mismatch}`);
+  console.log(`Shadowed items: ${result.shadowed}`);
   if (result.problems.length) {
     for (const problem of result.problems.slice(0, 20)) {
       console.log(`- ${problem}`);
@@ -779,132 +934,86 @@ async function verifyPack(pack) {
   let ok = 0;
   let missingTranslation = 0;
   let mismatch = 0;
+  let shadowed = 0;
   const problems = [];
   const rows = [];
 
   for (const item of pack.items) {
-    const translation = typeof item.translation === 'string' ? item.translation.trim() : '';
+    const translation = translateValue(item);
     if (!translation) {
       missingTranslation += 1;
       rows.push({
-        name: item.name,
-        sourceFamily: item.sourceFamily,
-        risk: item.risk || 'low',
-        skillFile: item.skillFile,
-        uiFile: item.uiFile,
-        sourceField: item.sourceField,
-        targetField: item.targetField || 'agents/openai.yaml.interface.short_description',
-        original: item.original,
-        translation: '',
-        currentUi: '',
+        ...item,
+        translation: item.translation || '',
+        currentValue: '',
         status: 'missing-translation',
         note: 'translation field is empty',
       });
       continue;
     }
-    const targetFile = item.targetFile || item.uiFile;
-    if (!(await exists(targetFile))) {
-      mismatch += 1;
-      const note = `missing ${targetFile}`;
-      problems.push(`${item.name}: ${note}`);
+    if (item.visible === false) {
+      shadowed += 1;
       rows.push({
-        name: item.name,
-        sourceFamily: item.sourceFamily,
-        risk: item.risk || 'low',
-        skillFile: item.skillFile,
-        uiFile: targetFile,
-        sourceField: item.sourceField,
-        targetField: item.targetField || 'agents/openai.yaml.interface.short_description',
-        original: item.original,
+        ...item,
         translation,
-        currentUi: '',
-        status: 'mismatch',
-        note,
+        currentValue: '',
+        status: 'shadowed',
+        note: item.shadowedBy ? `shadowed by ${item.shadowedBy}` : 'shadowed',
       });
       continue;
     }
-    const targetText = await fs.readFile(targetFile, 'utf8');
-    const pluginJson = item.targetField?.startsWith('plugin.json.interface.')
-      ? parsePluginJson(targetText)
-      : null;
-    const currentValue = item.targetField === 'prompt.frontmatter.description'
-      ? readTopLevelField(parseFrontmatter(targetText)?.frontmatterLines || [], 'description')
-      : item.targetField === 'prompt.frontmatter.argument-hint'
-        ? readTopLevelField(parseFrontmatter(targetText)?.frontmatterLines || [], 'argument-hint')
-      : item.targetField === 'prompt-template.task.description'
-        ? readPromptTemplateField(targetText, 'description')
-      : item.targetField === 'prompt-template.task.argument-hint'
-        ? readPromptTemplateField(targetText, 'argument-hint')
-      : item.targetField === 'SKILL.md.description'
-        ? readTopLevelField(parseFrontmatter(targetText)?.frontmatterLines || [], 'description')
-      : item.targetField === 'plugin.json.interface.longDescription'
-        ? pluginJson?.interface?.longDescription
-      : item.targetField === 'plugin.json.interface.shortDescription'
-        ? pluginJson?.interface?.shortDescription
-      : parseOpenAiYaml(targetText).short_description;
-    const pluginShortValue = item.targetField === 'plugin.json.interface.longDescription'
-      ? pluginJson?.interface?.shortDescription
-      : null;
-    if (currentValue !== translation || (pluginShortValue !== null && pluginShortValue !== translation)) {
+    if (!(await exists(item.targetFile))) {
       mismatch += 1;
-      const note = pluginShortValue !== null && pluginShortValue !== translation
-        ? `expected "${translation}" but found long="${currentValue ?? ''}", short="${pluginShortValue ?? ''}"`
-        : `expected "${translation}" but found "${currentValue ?? ''}"`;
-      problems.push(`${item.name}: ${note}`);
+      problems.push(`${item.name}: missing ${item.targetFile}`);
       rows.push({
-        name: item.name,
-        sourceFamily: item.sourceFamily,
-        risk: item.risk || 'low',
-        skillFile: item.skillFile,
-        uiFile: targetFile,
-        sourceField: item.sourceField,
-        targetField: item.targetField || 'agents/openai.yaml.interface.short_description',
-        original: item.original,
+        ...item,
         translation,
-        currentUi: currentValue ?? '',
+        currentValue: '',
         status: 'mismatch',
-        note,
+        note: `missing ${item.targetFile}`,
+      });
+      continue;
+    }
+    const targetText = await fs.readFile(item.targetFile, 'utf8');
+    let currentValue = '';
+    if (item.kind === 'skill') {
+      currentValue = parseOpenAiYaml(targetText).short_description ?? '';
+    } else if (item.sourceField === 'prompt.frontmatter.description') {
+      currentValue = readTopLevelField(parseFrontmatter(targetText)?.frontmatterLines || [], 'description') || '';
+    } else if (item.sourceField === 'prompt.frontmatter.argument-hint') {
+      currentValue = readTopLevelField(parseFrontmatter(targetText)?.frontmatterLines || [], 'argument-hint') || '';
+    } else if (item.sourceField === 'prompt-template.task.description') {
+      currentValue = readPromptTemplateField(targetText, 'description') || '';
+    } else if (item.sourceField === 'prompt-template.task.argument-hint') {
+      currentValue = readPromptTemplateField(targetText, 'argument-hint') || '';
+    }
+    if (currentValue !== translation) {
+      mismatch += 1;
+      problems.push(`${item.name}: expected "${translation}" but found "${currentValue}"`);
+      rows.push({
+        ...item,
+        translation,
+        currentValue,
+        status: 'mismatch',
+        note: `expected "${translation}" but found "${currentValue}"`,
       });
       continue;
     }
     ok += 1;
     rows.push({
-      name: item.name,
-      sourceFamily: item.sourceFamily,
-      risk: item.risk || 'low',
-      skillFile: item.skillFile,
-      uiFile: targetFile,
-      sourceField: item.sourceField,
-      targetField: item.targetField || 'agents/openai.yaml.interface.short_description',
-      original: item.original,
+      ...item,
       translation,
-      currentUi: currentValue ?? '',
+      currentValue,
       status: 'verified',
       note: '',
     });
   }
 
-  return { ok, missingTranslation, mismatch, problems, rows };
-}
-
-function escapeCell(value) {
-  return String(value ?? '')
-    .replace(/\r?\n/g, '<br>')
-    .replace(/\|/g, '\\|');
-}
-
-function defaultReportPath(packPath) {
-  const parsed = path.parse(path.resolve(packPath));
-  return path.join(parsed.dir, `${parsed.name}.audit.md`);
-}
-
-function summarizeBy(items, key) {
-  const counts = new Map();
-  for (const item of items) {
-    const label = item[key] ?? '';
-    counts.set(label, (counts.get(label) ?? 0) + 1);
+  if (Array.isArray(pack.shadowedItems)) {
+    shadowed += pack.shadowedItems.length;
   }
-  return [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+
+  return { ok, missingTranslation, mismatch, shadowed, problems, rows };
 }
 
 function buildAuditReport({ packPath, pack, verification }) {
@@ -915,53 +1024,37 @@ function buildAuditReport({ packPath, pack, verification }) {
   lines.push(`- Pack: \`${path.resolve(packPath)}\``);
   lines.push(`- Strategy: \`${pack.strategy}\``);
   lines.push(`- Item count: ${pack.itemCount}`);
+  lines.push(`- Shadowed count: ${pack.shadowedCount || 0}`);
   lines.push(`- Verified: ${verification.ok}`);
   lines.push(`- Missing translations: ${verification.missingTranslation}`);
   lines.push(`- Mismatches: ${verification.mismatch}`);
   lines.push('');
-  lines.push('## Scan Summary');
+  lines.push('## Visible Items');
   lines.push('');
-  lines.push('| Source family | Count |');
-  lines.push('| --- | ---: |');
-  for (const [family, count] of summarizeBy(pack.items, 'sourceFamily')) {
-    lines.push(`| ${escapeCell(family)} | ${count} |`);
-  }
-  lines.push('');
-  lines.push('## Verification Summary');
-  lines.push('');
-  lines.push('| Status | Count |');
-  lines.push('| --- | ---: |');
-  for (const [status, count] of summarizeBy(verification.rows, 'status')) {
-    lines.push(`| ${escapeCell(status)} | ${count} |`);
-  }
-  lines.push('');
-  lines.push('## Risk Summary');
-  lines.push('');
-  lines.push('| Risk | Count |');
-  lines.push('| --- | ---: |');
-  for (const [risk, count] of summarizeBy(verification.rows, 'risk')) {
-    lines.push(`| ${escapeCell(risk)} | ${count} |`);
-  }
-  lines.push('');
-  lines.push('## Bilingual Audit Table');
-  lines.push('');
-  lines.push('| # | Skill | Family | Risk | Source field | Target field | Original | Translation | Current text | Status | Note |');
+  lines.push('| # | Skill | Family | Target root | Source field | Target file | Original | Translation | Current | Status | Note |');
   lines.push('| ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
   verification.rows.forEach((row, index) => {
     lines.push(
-      `| ${index + 1} | ${escapeCell(row.name)} | ${escapeCell(row.sourceFamily)} | ${escapeCell(row.risk)} | ${escapeCell(row.sourceField)} | ${escapeCell(row.targetField)} | ${escapeCell(row.original)} | ${escapeCell(row.translation)} | ${escapeCell(row.currentUi)} | ${escapeCell(row.status)} | ${escapeCell(row.note)} |`,
+      `| ${index + 1} | ${escapeCell(row.name)} | ${escapeCell(row.sourceFamily)} | ${escapeCell(row.targetRoot)} | ${escapeCell(row.sourceField)} | ${escapeCell(row.targetFile)} | ${escapeCell(row.original)} | ${escapeCell(row.translation)} | ${escapeCell(row.currentValue)} | ${escapeCell(row.status)} | ${escapeCell(row.note)} |`,
     );
   });
   lines.push('');
-  lines.push('## File Inventory');
+  lines.push('## Shadowed Items');
   lines.push('');
-  lines.push('| Skill | Skill file | UI file |');
-  lines.push('| --- | --- | --- |');
-  for (const row of verification.rows) {
+  lines.push('| Skill | Source file | Shadowed by | Target root |');
+  lines.push('| --- | --- | --- | --- |');
+  (pack.shadowedItems || []).forEach((item) => {
     lines.push(
-      `| ${escapeCell(row.name)} | ${escapeCell(row.skillFile)} | ${escapeCell(row.uiFile)} |`,
+      `| ${escapeCell(item.name)} | ${escapeCell(item.skillFile)} | ${escapeCell(item.shadowedBy || '')} | ${escapeCell(item.targetRoot || '')} |`,
     );
-  }
+  });
+  lines.push('');
+  lines.push('## Verification Summary');
+  lines.push('');
+  lines.push(`- Verified: ${verification.ok}`);
+  lines.push(`- Missing translations: ${verification.missingTranslation}`);
+  lines.push(`- Mismatches: ${verification.mismatch}`);
+  lines.push(`- Shadowed: ${verification.shadowed}`);
   lines.push('');
   return `${lines.join('\n')}\n`;
 }
@@ -969,17 +1062,17 @@ function buildAuditReport({ packPath, pack, verification }) {
 async function reportCommand(options) {
   if (!options.pack) throw new Error('report requires --pack');
   const packPath = path.resolve(options.pack);
-  const pack = JSON.parse(await fs.readFile(packPath, 'utf8'));
+  const pack = await readSkillPack(packPath);
   const verification = await verifyPack(pack);
-  const reportPath = path.resolve(options.out || defaultReportPath(packPath));
+  const reportPath = path.resolve(options.out || `${path.parse(packPath).name}.audit.md`);
   const markdown = buildAuditReport({ packPath, pack, verification });
   await writeText(reportPath, markdown);
-
   console.log(`Report: ${reportPath}`);
-  console.log(`Rows: ${verification.rows.length}`);
+  console.log(`Rows: ${pack.items.length}`);
   console.log(`Verified: ${verification.ok}`);
   console.log(`Missing translations: ${verification.missingTranslation}`);
   console.log(`Mismatches: ${verification.mismatch}`);
+  console.log(`Shadowed: ${verification.shadowed}`);
   if (options.verify && verification.mismatch > 0) {
     process.exitCode = 1;
   }
@@ -991,7 +1084,7 @@ async function main() {
     usage();
     return;
   }
-  if (!['extract', 'apply', 'verify', 'report'].includes(command)) {
+  if (!['extract', 'apply', 'verify', 'report', 'dedupe'].includes(command)) {
     throw new Error(`Unknown command: ${command}`);
   }
   if (command === 'extract') {
@@ -1004,6 +1097,10 @@ async function main() {
   }
   if (command === 'verify') {
     await verifyCommand(options);
+    return;
+  }
+  if (command === 'dedupe') {
+    await dedupeCommand(options);
     return;
   }
   await reportCommand(options);
