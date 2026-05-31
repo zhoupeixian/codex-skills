@@ -9,6 +9,7 @@ function usage() {
   console.log(`Usage:
   node scripts/localize-codex-skills.mjs extract --out <pack.json> [--root <skills-dir> ...]
   node scripts/localize-codex-skills.mjs apply --pack <pack.json> [--backup-dir <dir>] [--allow-high-risk]
+  node scripts/localize-codex-skills.mjs replay --from <translated-pack.json> [--out <pack.json>] [--root <skills-dir> ...] [--apply] [--backup-dir <dir>] [--allow-high-risk]
   node scripts/localize-codex-skills.mjs verify --pack <pack.json>
   node scripts/localize-codex-skills.mjs report --pack <pack.json> [--out <report.md>] [--verify]
   node scripts/localize-codex-skills.mjs dedupe [--backup-dir <dir>]
@@ -26,7 +27,7 @@ function parseArgs(argv) {
     }
     const key = token.slice(2);
     const next = rest[i + 1];
-    if (key === 'allow-high-risk' || key === 'verify') {
+    if (key === 'allow-high-risk' || key === 'verify' || key === 'apply') {
       options[key] = true;
       continue;
     }
@@ -60,6 +61,10 @@ function requireUserProfile() {
 
 function codexHome() {
   return path.join(requireUserProfile(), '.codex');
+}
+
+function understandAnythingRepoRoot() {
+  return path.join(requireUserProfile(), '.understand-anything', 'repo', 'understand-anything-plugin');
 }
 
 function agentsSkillsRoot() {
@@ -136,11 +141,62 @@ function quote(value) {
   return JSON.stringify(value);
 }
 
+function skillNameFromPromptRoleName(name) {
+  if (!name) return '';
+  return String(name).startsWith('prompts:') ? String(name).slice('prompts:'.length) : String(name);
+}
+
 function escapeCell(value) {
   return String(value ?? '')
     .replace(/\r?\n/g, '<br>')
     .replace(/\|/g, '\\|')
     .trim();
+}
+
+function buildItemMatchKey(item) {
+  if (!item || typeof item !== 'object') return '';
+  if (typeof item.matchKey === 'string' && item.matchKey.trim()) {
+    return item.matchKey.trim();
+  }
+  if (item.kind === 'skill') {
+    return `skill::${item.name || ''}::${item.sourceField || ''}`;
+  }
+  if (item.kind === 'prompt-role') {
+    return `prompt-role::${skillNameFromPromptRoleName(item.name || path.basename(item.skillFile || '', '.md'))}::${item.sourceField || ''}`;
+  }
+  if (item.kind === 'prompt-template') {
+    return item.logicalKey || `prompt-template::${item.name || ''}::${item.sourceField || ''}`;
+  }
+  return item.logicalKey || `${item.kind || 'item'}::${item.name || ''}::${item.sourceField || ''}`;
+}
+
+function translationValueForItem(item) {
+  return typeof item.translation === 'string' ? item.translation.trim() : '';
+}
+
+function buildTranslationLookup(items) {
+  const lookup = new Map();
+  const duplicates = [];
+  for (const item of items) {
+    const translation = translationValueForItem(item);
+    if (!translation) continue;
+    const key = buildItemMatchKey(item);
+    if (!key) continue;
+    const existing = lookup.get(key);
+    if (existing && existing.translation !== translation) {
+      duplicates.push({ key, previous: existing, next: item });
+      continue;
+    }
+    lookup.set(key, { ...item, translation });
+  }
+  return { lookup, duplicates };
+}
+
+function decoratePackItems(items) {
+  return items.map((item) => ({
+    ...item,
+    matchKey: buildItemMatchKey(item),
+  }));
 }
 
 function parseFrontmatter(content) {
@@ -417,6 +473,7 @@ async function defaultSkillRoots() {
   return [
     path.join(codex, 'skills'),
     agentsSkillsRoot(),
+    path.join(understandAnythingRepoRoot(), 'skills'),
     path.join(codex, 'superpowers', 'skills'),
     ...(await collectChildRoots(path.join(codex, 'plugins', 'cache', 'openai-curated'))),
     ...(await collectChildRoots(path.join(codex, 'plugins', 'cache', 'openai-primary-runtime'))),
@@ -620,7 +677,7 @@ async function buildPack(customRoots) {
   const { visible: visibleSkills, shadowed: shadowedSkills } = selectVisibleCandidates(rawSkills);
   const promptRoles = await collectPromptRoleCandidates();
   const promptTemplates = await collectPromptTemplateCandidates(visibleSkills);
-  const items = [...visibleSkills, ...promptRoles, ...promptTemplates].sort(
+  const items = decoratePackItems([...visibleSkills, ...promptRoles, ...promptTemplates]).sort(
     (a, b) =>
       a.name.localeCompare(b.name) ||
       a.kind.localeCompare(b.kind) ||
@@ -724,6 +781,50 @@ async function extractCommand(options) {
   const pack = await buildPack(options.root);
   await writeJson(path.resolve(options.out), pack);
   console.log(`Extracted ${pack.itemCount} skills to ${path.resolve(options.out)}`);
+}
+
+async function replayCommand(options) {
+  if (!options.from) throw new Error('replay requires --from');
+  const sourcePack = await readSkillPack(path.resolve(options.from));
+  const { lookup, duplicates } = buildTranslationLookup(sourcePack.items);
+  if (duplicates.length) {
+    throw new Error(`Replay source has conflicting translations for ${duplicates.length} item keys`);
+  }
+
+  const basePack = await buildPack(options.root);
+  const items = basePack.items.map((item) => {
+    const matchKey = buildItemMatchKey(item);
+    const source = lookup.get(matchKey);
+    return {
+      ...item,
+      matchKey,
+      translation: source ? source.translation : '',
+    };
+  });
+
+  const replayPack = {
+    ...basePack,
+    generatedAt: new Date().toISOString(),
+    replayedFrom: path.resolve(options.from),
+    itemCount: items.length,
+    items: decoratePackItems(items),
+  };
+
+  if (options.out) {
+    await writeJson(path.resolve(options.out), replayPack);
+    console.log(`Replayed pack written to ${path.resolve(options.out)}`);
+  } else {
+    await writeJson(path.resolve(options.from), replayPack);
+    console.log(`Replayed pack updated in place at ${path.resolve(options.from)}`);
+  }
+
+  if (options.apply) {
+    await applyCommand({
+      pack: options.out || options.from,
+      'backup-dir': options['backup-dir'],
+      'allow-high-risk': options['allow-high-risk'],
+    });
+  }
 }
 
 function buildBackupFolder(packPath, explicitBackupDir) {
@@ -1084,7 +1185,7 @@ async function main() {
     usage();
     return;
   }
-  if (!['extract', 'apply', 'verify', 'report', 'dedupe'].includes(command)) {
+  if (!['extract', 'apply', 'replay', 'verify', 'report', 'dedupe'].includes(command)) {
     throw new Error(`Unknown command: ${command}`);
   }
   if (command === 'extract') {
@@ -1093,6 +1194,10 @@ async function main() {
   }
   if (command === 'apply') {
     await applyCommand(options);
+    return;
+  }
+  if (command === 'replay') {
+    await replayCommand(options);
     return;
   }
   if (command === 'verify') {
