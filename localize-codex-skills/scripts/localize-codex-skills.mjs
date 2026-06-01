@@ -62,6 +62,10 @@ function codexHome() {
   return path.join(requireUserProfile(), '.codex');
 }
 
+function understandAnythingRepoRoot() {
+  return path.join(requireUserProfile(), '.understand-anything', 'repo', 'understand-anything-plugin');
+}
+
 function agentsSkillsRoot() {
   return path.join(requireUserProfile(), '.agents', 'skills');
 }
@@ -485,6 +489,7 @@ async function defaultSkillRoots() {
   return [
     path.join(codex, 'skills'),
     agentsSkillsRoot(),
+    path.join(understandAnythingRepoRoot(), 'skills'),
     path.join(codex, 'superpowers', 'skills'),
     ...(await collectChildRoots(path.join(codex, 'plugins', 'cache', 'openai-curated'))),
     ...(await collectChildRoots(path.join(codex, 'plugins', 'cache', 'openai-primary-runtime'))),
