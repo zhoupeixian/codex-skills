@@ -3,11 +3,11 @@
 ## 用户可提前提供的配置
 
 ```yaml
-workspace: "D:\\SVN\\ZHERP"
+workspace: "<workspace>"
 svn_config_dir: "<sandbox_svn_config_dir>"
 time_range:
-  start: "2026-06-03 19:00:00"
-  end: "2026-06-04 18:59:59"
+  start: "<start datetime>"
+  end: "<end datetime>"
 maven_cmd: "<maven_cmd>"
 maven_settings: "<workspace>\\bokeerp\\maven_settings.xml"
 entity_generator_module: "../erp-entity-generator"
@@ -21,7 +21,7 @@ skip_log_patterns:
 
 ## 缺配置时的处理
 
-- 缺 `workspace`：要求用户提供 ZHERP 根目录。
+- 缺 `workspace`：要求用户提供 ZHERP 根目录；不要自行扫描磁盘猜测工作副本路径。
 - 缺 `svn_config_dir`：Agent 先判断当前是否是沙箱、CI 或受限自动化用户；如果是，要求用户提供或创建独立 SVN config 目录；正式环境无需额外处理。
 - 缺 `time_range`：询问用户使用自定义范围，还是默认业务日窗口。
 - 只有用户要求 Maven 构建、实体生成或完整审查时，才处理 `maven_cmd` 和 `maven_settings`。
