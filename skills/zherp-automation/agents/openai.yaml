@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZHERP-Automation"
+  short_description: "ZHERP SVN 认证、日志、构建与可选审查"
+  default_prompt: "Use $zherp-automation to inspect SVN logs, update, build, generate entities, or optionally review SVN commits for a ZHERP/YigoERP project."
