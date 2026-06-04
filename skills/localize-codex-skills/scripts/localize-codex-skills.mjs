@@ -9,7 +9,6 @@ function usage() {
   console.log(`Usage:
   node scripts/localize-codex-skills.mjs extract --out <pack.json> [--root <skills-dir> ...]
   node scripts/localize-codex-skills.mjs apply --pack <pack.json> [--backup-dir <dir>] [--allow-high-risk]
-  node scripts/localize-codex-skills.mjs replay --from <translated-pack.json> [--out <pack.json>] [--root <skills-dir> ...] [--apply] [--backup-dir <dir>] [--allow-high-risk]
   node scripts/localize-codex-skills.mjs verify --pack <pack.json>
   node scripts/localize-codex-skills.mjs report --pack <pack.json> [--out <report.md>] [--verify]
   node scripts/localize-codex-skills.mjs dedupe [--backup-dir <dir>]
@@ -27,7 +26,7 @@ function parseArgs(argv) {
     }
     const key = token.slice(2);
     const next = rest[i + 1];
-    if (key === 'allow-high-risk' || key === 'verify' || key === 'apply') {
+    if (key === 'allow-high-risk' || key === 'verify') {
       options[key] = true;
       continue;
     }
@@ -85,6 +84,14 @@ function sourcePriority(skillFile) {
   return 50;
 }
 
+function isPersistentSkillRoot(skillRoot) {
+  const normalized = normalizeForCompare(skillRoot);
+  return (
+    normalized.includes('/.agents/skills/') ||
+    normalized.includes('/.codex/skills/')
+  );
+}
+
 async function findSkillRoot(filePath) {
   let current = path.dirname(filePath);
   while (true) {
@@ -95,8 +102,39 @@ async function findSkillRoot(filePath) {
   }
 }
 
+function resolveShadowRootForName(skillName) {
+  return path.join(agentsSkillsRoot(), skillName);
+}
+
+function isPluginCacheSkillRoot(skillRoot) {
+  const normalized = normalizeForCompare(skillRoot);
+  return (
+    normalized.includes('/.codex/superpowers/skills/') ||
+    normalized.includes('/.codex/plugins/cache/')
+  );
+}
+
 function isAgentsSkillRoot(skillRoot) {
   return normalizeForCompare(skillRoot).includes('/.agents/skills/');
+}
+
+async function ensureDirectoryCopy(sourceRoot, targetRoot) {
+  if (!sourceRoot || !targetRoot) return { created: false };
+  if (normalizeForCompare(sourceRoot) === normalizeForCompare(targetRoot)) {
+    return { created: false };
+  }
+  if (await exists(targetRoot)) {
+    return { created: false };
+  }
+  await fs.mkdir(path.dirname(targetRoot), { recursive: true });
+  await fs.cp(sourceRoot, targetRoot, {
+    recursive: true,
+    dereference: false,
+    errorOnExist: false,
+    force: false,
+    preserveTimestamps: true,
+  });
+  return { created: true };
 }
 
 async function pluginShadowRoots(baseDir) {
@@ -141,62 +179,11 @@ function quote(value) {
   return JSON.stringify(value);
 }
 
-function skillNameFromPromptRoleName(name) {
-  if (!name) return '';
-  return String(name).startsWith('prompts:') ? String(name).slice('prompts:'.length) : String(name);
-}
-
 function escapeCell(value) {
   return String(value ?? '')
     .replace(/\r?\n/g, '<br>')
     .replace(/\|/g, '\\|')
     .trim();
-}
-
-function buildItemMatchKey(item) {
-  if (!item || typeof item !== 'object') return '';
-  if (typeof item.matchKey === 'string' && item.matchKey.trim()) {
-    return item.matchKey.trim();
-  }
-  if (item.kind === 'skill') {
-    return `skill::${item.name || ''}::${item.sourceField || ''}`;
-  }
-  if (item.kind === 'prompt-role') {
-    return `prompt-role::${skillNameFromPromptRoleName(item.name || path.basename(item.skillFile || '', '.md'))}::${item.sourceField || ''}`;
-  }
-  if (item.kind === 'prompt-template') {
-    return item.logicalKey || `prompt-template::${item.name || ''}::${item.sourceField || ''}`;
-  }
-  return item.logicalKey || `${item.kind || 'item'}::${item.name || ''}::${item.sourceField || ''}`;
-}
-
-function translationValueForItem(item) {
-  return typeof item.translation === 'string' ? item.translation.trim() : '';
-}
-
-function buildTranslationLookup(items) {
-  const lookup = new Map();
-  const duplicates = [];
-  for (const item of items) {
-    const translation = translationValueForItem(item);
-    if (!translation) continue;
-    const key = buildItemMatchKey(item);
-    if (!key) continue;
-    const existing = lookup.get(key);
-    if (existing && existing.translation !== translation) {
-      duplicates.push({ key, previous: existing, next: item });
-      continue;
-    }
-    lookup.set(key, { ...item, translation });
-  }
-  return { lookup, duplicates };
-}
-
-function decoratePackItems(items) {
-  return items.map((item) => ({
-    ...item,
-    matchKey: buildItemMatchKey(item),
-  }));
 }
 
 function parseFrontmatter(content) {
@@ -468,6 +455,35 @@ function packItemId(kind, key, sourceFile) {
   return `${kind}::${key}::${normalizeForCompare(sourceFile)}`;
 }
 
+function uniqueStrings(values) {
+  return [...new Set(values.filter((value) => typeof value === 'string' && value.trim()).map((value) => value.trim()))].sort((a, b) =>
+    a.localeCompare(b),
+  );
+}
+
+function packStructureSignature(pack) {
+  const items = Array.isArray(pack?.items) ? pack.items : [];
+  const shadowedItems = Array.isArray(pack?.shadowedItems) ? pack.shadowedItems : [];
+  return {
+    itemIds: items.map((item) => String(item?.id || '')).sort((a, b) => a.localeCompare(b)),
+    shadowedIds: shadowedItems
+      .map((item) => String(item?.id || item?.name || ''))
+      .sort((a, b) => a.localeCompare(b)),
+  };
+}
+
+function packRootsSignature(pack) {
+  const roots = Array.isArray(pack?.sourceRoots) ? pack.sourceRoots : [];
+  return uniqueStrings(roots);
+}
+
+function signaturesMatch(expected, actual) {
+  return (
+    JSON.stringify(expected.itemIds) === JSON.stringify(actual.itemIds) &&
+    JSON.stringify(expected.shadowedIds) === JSON.stringify(actual.shadowedIds)
+  );
+}
+
 async function defaultSkillRoots() {
   const codex = codexHome();
   return [
@@ -677,7 +693,7 @@ async function buildPack(customRoots) {
   const { visible: visibleSkills, shadowed: shadowedSkills } = selectVisibleCandidates(rawSkills);
   const promptRoles = await collectPromptRoleCandidates();
   const promptTemplates = await collectPromptTemplateCandidates(visibleSkills);
-  const items = decoratePackItems([...visibleSkills, ...promptRoles, ...promptTemplates]).sort(
+  const items = [...visibleSkills, ...promptRoles, ...promptTemplates].sort(
     (a, b) =>
       a.name.localeCompare(b.name) ||
       a.kind.localeCompare(b.kind) ||
@@ -687,11 +703,19 @@ async function buildPack(customRoots) {
   const shadowedItems = shadowedSkills.sort(
     (a, b) => a.name.localeCompare(b.name) || a.skillFile.localeCompare(b.skillFile),
   );
+  const sourceRoots = uniqueStrings([
+    ...(customRoots.length ? customRoots : await defaultSkillRoots()),
+    ...items.map((item) => item.skillRoot),
+    ...shadowedItems.map((item) => item.skillRoot),
+  ]);
+  const structureSignature = packStructureSignature({ items, shadowedItems });
   return {
     generatedAt: new Date().toISOString(),
     strategy: 'in-place-plugin-cache-plus-audit',
     itemCount: items.length,
     shadowedCount: shadowedItems.length,
+    sourceRoots,
+    structureSignature,
     items,
     shadowedItems,
   };
@@ -783,50 +807,6 @@ async function extractCommand(options) {
   console.log(`Extracted ${pack.itemCount} skills to ${path.resolve(options.out)}`);
 }
 
-async function replayCommand(options) {
-  if (!options.from) throw new Error('replay requires --from');
-  const sourcePack = await readSkillPack(path.resolve(options.from));
-  const { lookup, duplicates } = buildTranslationLookup(sourcePack.items);
-  if (duplicates.length) {
-    throw new Error(`Replay source has conflicting translations for ${duplicates.length} item keys`);
-  }
-
-  const basePack = await buildPack(options.root);
-  const items = basePack.items.map((item) => {
-    const matchKey = buildItemMatchKey(item);
-    const source = lookup.get(matchKey);
-    return {
-      ...item,
-      matchKey,
-      translation: source ? source.translation : '',
-    };
-  });
-
-  const replayPack = {
-    ...basePack,
-    generatedAt: new Date().toISOString(),
-    replayedFrom: path.resolve(options.from),
-    itemCount: items.length,
-    items: decoratePackItems(items),
-  };
-
-  if (options.out) {
-    await writeJson(path.resolve(options.out), replayPack);
-    console.log(`Replayed pack written to ${path.resolve(options.out)}`);
-  } else {
-    await writeJson(path.resolve(options.from), replayPack);
-    console.log(`Replayed pack updated in place at ${path.resolve(options.from)}`);
-  }
-
-  if (options.apply) {
-    await applyCommand({
-      pack: options.out || options.from,
-      'backup-dir': options['backup-dir'],
-      'allow-high-risk': options['allow-high-risk'],
-    });
-  }
-}
-
 function buildBackupFolder(packPath, explicitBackupDir) {
   if (explicitBackupDir) return path.resolve(explicitBackupDir);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -881,6 +861,19 @@ async function applyCommand(options) {
   if (!options.pack) throw new Error('apply requires --pack');
   const packPath = path.resolve(options.pack);
   const pack = await readSkillPack(packPath);
+  const currentPack = await buildPack(packRootsSignature(pack));
+  const expectedSignature = packStructureSignature(pack);
+  const currentSignature = packStructureSignature(currentPack);
+  if (!signaturesMatch(expectedSignature, currentSignature)) {
+    throw new Error(
+      [
+        'Pack is stale or mismatched with the currently visible skill set.',
+        'Re-run extract/replay to regenerate the pack before apply.',
+        `Expected items: ${expectedSignature.itemIds.length}, current items: ${currentSignature.itemIds.length}.`,
+        `Expected shadowed: ${expectedSignature.shadowedIds.length}, current shadowed: ${currentSignature.shadowedIds.length}.`,
+      ].join(' '),
+    );
+  }
   const actionable = pack.items.filter((item) => translateValue(item).length > 0);
   if (!actionable.length) {
     console.log('No translated items to apply.');
@@ -896,9 +889,25 @@ async function applyCommand(options) {
   await fs.mkdir(filesDir, { recursive: true });
 
   const fileState = new Map();
+  const shadowRoots = new Set();
+  const clonedTargets = new Map();
   const writes = new Map();
 
   for (const item of actionable) {
+    if (item.kind === 'skill' && item.shadowTarget) {
+      const sourceRoot = item.skillRoot;
+      const targetRoot = item.targetRoot;
+      if (!clonedTargets.has(targetRoot)) {
+        const existed = await exists(targetRoot);
+        if (!existed) {
+          await ensureDirectoryCopy(sourceRoot, targetRoot);
+          shadowRoots.add(targetRoot);
+          clonedTargets.set(targetRoot, true);
+        } else {
+          clonedTargets.set(targetRoot, false);
+        }
+      }
+    }
     if (!writes.has(item.targetFile)) {
       const existed = await exists(item.targetFile);
       const content = existed ? await fs.readFile(item.targetFile, 'utf8') : '';
@@ -954,7 +963,7 @@ async function applyCommand(options) {
     createdAt: new Date().toISOString(),
     packPath,
     files: manifestFiles,
-    shadowRoots: [],
+    shadowRoots: [...shadowRoots],
   });
 
   console.log(`Applied ${actionable.length} translations across ${changedFiles} files.`);
@@ -1185,7 +1194,7 @@ async function main() {
     usage();
     return;
   }
-  if (!['extract', 'apply', 'replay', 'verify', 'report', 'dedupe'].includes(command)) {
+  if (!['extract', 'apply', 'verify', 'report', 'dedupe'].includes(command)) {
     throw new Error(`Unknown command: ${command}`);
   }
   if (command === 'extract') {
@@ -1194,10 +1203,6 @@ async function main() {
   }
   if (command === 'apply') {
     await applyCommand(options);
-    return;
-  }
-  if (command === 'replay') {
-    await replayCommand(options);
     return;
   }
   if (command === 'verify') {

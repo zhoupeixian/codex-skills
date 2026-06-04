@@ -52,6 +52,8 @@
 
 插件、Bundled、Superpowers 等来源直接写回各自缓存目录中的 `agents/openai.yaml`，不要复制到 `~/.agents/skills`。
 
+应用前必须重新扫描当前可见 skill 并与 pack 的结构指纹比对；如果 pack 不是当前最新的 `extract/replay` 产物，直接拒绝应用。
+
 ## 校验规则
 
 校验步骤会比较当前目标字段和 `translation` 是否一致。

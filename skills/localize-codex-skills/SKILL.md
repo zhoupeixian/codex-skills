@@ -7,18 +7,18 @@ description: 用于扫描 Codex 可见的 skill，生成翻译包，就地应用
 
 ## 核心目标
 
-把 Codex 里能看到的 skill 描述翻成中文，并且保留一份可重放的翻译包。插件缓存如果被刷新，就用这份包重新定位并恢复中文。
+把 Codex 里能看到的 skill 描述翻成中文，并且让翻译结果在重启后还能保住。
 
 ## 默认策略
 
 1. 先扫描当前 Codex 会读取的 skill 根目录，排除 `.codex/.tmp` 临时目录。
 2. 对当前可见 skill 按名称去重，并记录被同名更高优先级 skill 遮蔽的项。
 3. 对 `~/.agents/skills` 里的真实个人 skill，直接原地改。
-4. 对插件、Bundled、Superpowers 这类缓存来源，直接写回当前可见缓存里的 `agents/openai.yaml`，不要复制到 `~/.agents/skills`。
+4. 对插件、Bundled、Superpowers 这类缓存来源，直接写回插件缓存里的 `agents/openai.yaml`，不要复制到 `~/.agents/skills`。
 5. 默认只改 `agents/openai.yaml.interface.short_description` 这一层。
 6. `SKILL.md` frontmatter `description`、提示词 frontmatter、`argument-hint` 是高风险字段，只有用户明确允许时才改。
 7. 如果历史流程已经在 `~/.agents/skills` 生成了插件影子副本，运行 `dedupe` 归档清理。
-8. 如果缓存目录被刷新或版本变动，先用 `replay` 把旧翻译包映射到当前可见 skill，再按需 `apply`。
+8. `apply` 前必须先重新扫描当前可见 skill，并和待应用 pack 的结构指纹比对；如果 pack 不是这次最新 `extract/replay` 的结果，直接拒绝应用并重新生成。
 
 ## 工作流
 
@@ -62,21 +62,6 @@ description: 用于扫描 Codex 可见的 skill，生成翻译包，就地应用
 - 直接写入 pack 中的目标文件
 - 自动备份所有被改动的文件
 - 生成回滚脚本
-
-### 3.1 重放
-
-运行：
-
-```powershell
-& "<node>" scripts/localize-codex-skills.mjs replay --from .\skill-ui-pack.translated.json --out .\skill-ui-pack.replayed.json
-```
-
-重放会：
-
-- 读取一份已翻译的旧 pack
-- 按当前可见 skill 重新匹配
-- 把旧译文迁移到新的当前目标上
-- 必要时再接 `--apply` 直接写回
 
 ### 4. 校验
 
@@ -136,5 +121,4 @@ description: 用于扫描 Codex 可见的 skill，生成翻译包，就地应用
 - 不要默认改提示词 frontmatter
 - 不要把写入落到 `.codex\.tmp`
 - 不要把插件 skill 复制到 `~\.agents\skills`
-- 不要把“缓存会永久不变”当成前提
 - 如果用户明确要做高风险字段改写，先说明影响范围，再继续
