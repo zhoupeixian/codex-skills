@@ -1,8 +1,8 @@
-﻿# Personal Codex Skills Repository
+# 个人 Codex Skills 仓库
 
-This repository stores Codex skills I maintain locally. Each skill lives in `skills/<skill-name>/` and keeps the standard Codex skill structure.
+这个仓库用于存放个人维护的 Codex skills。每个 skill 独立放在 `skills/<skill-name>/` 下，并保留标准 Codex skill 结构。
 
-## Repository Layout
+## 仓库结构
 
 ```text
 skills/
@@ -19,44 +19,44 @@ skills/
 
 ## Skills
 
-| Skill | Purpose | Status |
+| Skill | 用途 | 状态 |
 | --- | --- | --- |
-| `localize-codex-skills` | Scan visible Codex skills, generate translation packs, apply localized descriptions, verify coverage, produce audit reports, and clean up stale shadow copies. | Available |
-| `zherp-automation` | Automate ZHERP/YigoERP SVN workflows with authentication, log collection, optional update, Maven build, entity generation, diff retrieval, and review logs. | Available |
+| `localize-codex-skills` | 扫描 Codex 可见 skill，生成翻译包，就地应用中文 UI 描述，校验覆盖，生成审计报告和回滚脚本，并清理历史影子副本。 | 可用 |
+| `zherp-automation` | ZHERP/YigoERP SVN 自动化 skill，覆盖认证、日志拉取、可选更新、Maven 构建、实体生成、diff 拉取和审查日志生成。 | 可用 |
 
-## Add a New Skill
+## 添加新 Skill
 
-Place a new skill as an independent directory under `skills/`:
+新 skill 作为独立目录放在 `skills/` 下：
 
 ```text
 skills/<new-skill-name>/SKILL.md
 ```
 
-Recommended minimal structure:
+推荐最小结构：
 
-- `SKILL.md`: required, defines the skill and workflow.
-- `agents/openai.yaml`: optional, for Codex skill UI metadata.
-- `references/`: optional, supporting references loaded on demand.
-- `scripts/`: optional, deterministic helper scripts.
+- `SKILL.md`：必需，定义 skill 和工作流。
+- `agents/openai.yaml`：可选，用于 Codex skill 列表的 UI 元数据。
+- `references/`：可选，按需加载的参考文档。
+- `scripts/`：可选，确定性辅助脚本。
 
-## Local Install
+## 本地安装
 
-When installing or updating manually, copy the skill directory to:
+手动安装或更新时，将 skill 目录复制到：
 
 ```text
 C:\Users\31487\.codex\skills\<skill-name>
 ```
 
-Example:
+For example:
 
 ```powershell
 Copy-Item -Recurse -Force .\skills\localize-codex-skills C:\Users\31487\.codex\skills\localize-codex-skills
 ```
 
-## Maintenance Rules
+## 维护规则
 
-- Each skill must be self-contained.
-- Do not commit translated packs, audit reports, backups, or local shadow copies.
-- Keep reusable automation in `scripts/`.
-- Skills that modify model-tuning-related metadata must clearly document risk boundaries.
-- `~/.agents/skills` is only for real personal skills, not for plugin skill shadow copies.
+- 每个 skill 必须自包含。
+- 不提交翻译包、审计报告、备份和本地快照。
+- 可重复操作优先放进 `scripts/`。
+- 会修改模型调度相关元数据的 skill，必须在文档中明确标出风险边界。
+- `~/.agents/skills` 只用于真实个人 skill，不用于保存插件 skill 的影子副本。
