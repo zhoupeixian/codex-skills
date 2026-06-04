@@ -32,6 +32,9 @@ Dispatch a code reviewer subagent to catch issues before they cascade. The revie
 
 Use Task tool with `general-purpose` type, fill template at `code-reviewer.md`
 
+If the current Codex environment has no Task/subagent tool, use `code-reviewer.md`
+as a self-review checklist for a second pass before finalizing the review log.
+
 **Placeholders:**
 - `{DESCRIPTION}` - Brief summary of what you built
 - `{PLAN_OR_REQUIREMENTS}` - What it should do
