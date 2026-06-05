@@ -14,6 +14,7 @@ description: Automate ZHERP/YigoERP SVN workflows with strict SVN authentication
 - 受限环境的 SVN 配置只使用 `<workspace>\.zherp-automation`；不要读取、迁移或解密主用户 SVN auth 缓存。
 - `<workspace>\.zherp-automation` 是本机私有配置目录，禁止提交。
 - `$env:USERPROFILE\.codex\automations` 只用于自动化记忆/状态，不是 SVN 认证配置来源。正式自动化任务可按需读取/更新记忆，但不能用记忆替代本轮 SVN 日志、diff 或认证配置。
+- 除非用户明确要求诊断历史运行，否则每次日志/审查请求都视为一轮新运行。禁止为了“复用、增量、避免重复”在本轮 `log` 成功前搜索或读取 `automation-output\svn审查` 下已有的 `log.json`、diff、manifest 或审查日志。
 
 ## Required Order
 
@@ -73,6 +74,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps
 
 - `log` 必须显式写入本轮 `run_dir\log.json`。
 - `diff` 必须显式写入本轮 `run_dir\diffs`。
+- 本轮 `log` 成功前，不读取、不搜索、不解析任何历史输出目录里的 `log.json`、diff、manifest 或审查日志。历史产物只允许在用户明确要求排查历史运行时读取。
 - `log.json` 是规范对象，顶层包含 `schema_version`、`time_range`、`revisions`、`reviewable_revisions`、`skipped_revisions`；不要把它当成原始数组。
 - 脚本 `log` 返回 `ok` 后，优先使用 stdout JSON 的 `reviewable_revisions`；需要从文件恢复时读取 `log.json.reviewable_revisions`。禁止因为解析预期错误改用手写 `svn log --xml` 重拉。
 - 审查只能基于本轮 `reviewable_revisions` 和本轮 diff manifest。

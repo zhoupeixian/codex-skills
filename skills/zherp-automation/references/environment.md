@@ -174,6 +174,8 @@ svn diff -c <revision> @svnArgs .
 <workspace>\automation-output\svn审查\<YYYY-MM-DD>\run-<yyyyMMdd-HHmmss>
 ```
 
+除非用户明确要求诊断历史运行，否则每次日志/审查请求都视为一轮新运行。本轮 `log` 成功前，不要搜索、读取或解析 `automation-output\svn审查` 下已有的 `log.json`、diff、manifest 或审查日志。
+
 本轮审查只能使用本轮 `log.json`、本轮 diff manifest 和本轮新写入的审查日志。不要把日期目录中已有的旧 `log.json`、旧 diff、旧审查日志或自动化记忆当成本轮结果。
 
 `log.json` 是脚本生成的规范对象，顶层包含：
