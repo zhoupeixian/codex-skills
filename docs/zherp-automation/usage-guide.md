@@ -26,12 +26,6 @@ C:\Users\<你的用户名>\.codex\skills\zherp-automation
 来源：https://github.com/zhoupeixian/codex-skills
 ```
 
-截图预留：
-
-```text
-[此处放 Codex 安装截图]
-```
-
 ## 首次使用
 
 自动化正式使用前，先手动跑一次。目的：
