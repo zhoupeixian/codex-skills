@@ -19,26 +19,32 @@ Run the ZHERP/YigoERP SVN automation as a staged, script-backed workflow. The sk
 
 ## Execution Model
 
-Before running `prepare`, `auth-check`, `log`, `update`, Maven, or any other command, resolve the current run’s `workspace` and `goal`.
+Before running `prepare`, `auth-check`, `log`, `update`, Maven, or any other command, resolve the current run’s `workspace` and user-facing goal.
 
-- `goal` must come from the user request or automation task definition. If it is missing or ambiguous, stop and ask what to do. Do not infer it from this skill’s capabilities.
+- The user-facing goal must come from the user request or automation task definition. If it is missing or ambiguous, stop and ask with this exact numbered list:
+  1. 更新代码
+  2. 生成实体
+  3. Maven 编译
+  4. 更新代码 + 生成实体 + Maven 编译
+  5. 代码审查
 - `workspace` may come from the user request, automation configuration, script arguments, or an execution context that clearly identifies the ZHERP SVN working copy. If it cannot be determined confidently, stop and ask for it.
 - `restricted` must be decided from the current execution environment and user-provided config; pass explicit `-Restricted yes` or `-Restricted no`.
-- `time_range` is needed only for revision discovery goals. Use explicit start/end when provided; otherwise use the default business window for “today/current day”: previous local date `19:00:00` through current local date `18:59:59`.
+- `time_range` is needed only for 代码审查, or when the user explicitly asks to inspect SVN commit records. Use explicit start/end when provided; otherwise use the default business window for “today/current day”: previous local date `19:00:00` through current local date `18:59:59`.
 - `revision_filter` is optional and deterministic. Use script parameters for exact author/message filtering only; leave semantic filtering to Codex after `log.json` exists.
 
-Route the goal before asking for optional inputs or running commands:
+Route the user-facing goal before asking for optional inputs or running commands. Keep script command names internal.
 
-| Goal | Required inputs | Command flow | Output |
+| 用户目标 | 必要输入 | 内部命令流 | 输出 |
 | --- | --- | --- | --- |
-| `update` | `workspace`, `restricted` | `auth-check -> update` | update result |
-| `entity-generate` | `workspace` | `entity-generate` | entity generation result |
-| `maven-build` | `workspace` | `maven-build` | compile result |
-| `update + entity-generate + maven-build` | `workspace`, `restricted` | `auth-check -> post-log-prep` | prep result |
-| `revision-listing` | `workspace`, `restricted`, `time_range` | `auth-check -> log` | `log.json` summary |
-| `code-review` | `workspace`, `restricted`, `time_range` | `auth-check -> log -> post-log-prep -> diff -> review -> report` | review report |
+| 更新代码 | `workspace`, `restricted` | `auth-check -> update` | 更新结果 |
+| 生成实体 | `workspace` | `entity-generate` | 实体生成结果 |
+| Maven 编译 | `workspace` | `maven-build` | 编译结果 |
+| 更新代码 + 生成实体 + Maven 编译 | `workspace`, `restricted` | `auth-check -> post-log-prep` | 准备结果 |
+| 代码审查 | `workspace`, `restricted`, `time_range` | `auth-check -> log -> post-log-prep -> diff -> review -> report` | 审查报告 |
 
-If configuration details are missing or unclear, read only the relevant section of [environment.md](references/environment.md).
+SVN 提交记录查询是辅助能力，不是默认用户目标。只有用户明确要求“查提交”“看日志”或“列 revision”时，才执行 `auth-check -> log`，输出 `log.json` 摘要并停止。
+
+如果配置缺失或不明确，只读取 [environment.md](references/environment.md) 中与当前阻塞相关的部分。
 
 ## Script Contract
 
@@ -59,7 +65,7 @@ $runDir = Join-Path $workspace ("automation-output\svn审查\" + (Get-Date -Form
 powershell -NoProfile -ExecutionPolicy Bypass -File $script auth-check -Workspace $workspace -Restricted $restricted
 ```
 
-Use `log` only when the requested goal needs revision discovery, such as an explicit revision listing request or full code review. Do not run it for update/entity/build-only requests.
+Use `log` only when the user explicitly asks to query SVN commits or run code review. Do not run it for update/entity/build-only requests.
 
 The `log` command supports only deterministic filters:
 
@@ -87,7 +93,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $script diff -Workspace $wor
 Read script JSON `status` before deciding the next step:
 
 - `ok`: continue.
-- `need_env`: stop, run `env-template`, give the user the template.
+- `need_env`: stop. The script creates `<workspace>\.zherp-automation\svn-automation.env` if missing; tell the user to fill `SVN_USERNAME` and `SVN_PASSWORD` in that local file, then continue after they confirm. Never ask the user to send SVN credentials in chat.
 - `restricted_unresolved`: stop, decide and pass explicit `-Restricted yes/no`.
 - `workspace_invalid`, `svn_not_found`, `config_error`, `path_out_of_scope`: stop and ask for the missing/fixed input.
 - `auth_failed`: stop and report `本次阻塞于 SVN 远端认证失败`.
@@ -107,10 +113,9 @@ Read script JSON `status` before deciding the next step:
 
 ## Review Handling
 
-Only `revision-listing` and `code-review` enter this section.
+只有“代码审查”进入本节。如果用户只是明确要求查看 SVN 提交记录，执行 `log`、汇总总提交数/候选提交数/跳过提交数，然后在进入本节前停止。
 
-- `revision-listing`: stop after `log` and summarize count/reviewable/skipped.
-- `code-review`:
+- 代码审查:
   1. If `count == 0`, write the short `无新增提交` report.
   2. Otherwise use only current-run `reviewable_revisions`.
   3. If `reviewable_revisions` is empty, write the short `无需要审查的提交` report.

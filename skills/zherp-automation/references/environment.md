@@ -54,7 +54,7 @@ These files are local/private and must not be committed.
 
 ## Env Template
 
-When the script returns `need_env`, give the user this template and stop:
+When the script returns `need_env`, it creates `<workspace>\.zherp-automation\svn-automation.env` if the file is missing. Stop and tell the user to fill `SVN_USERNAME` and `SVN_PASSWORD` in that local file; never ask them to send SVN credentials in chat.
 
 ```dotenv
 # ZHERP-Automation local secrets. Do not commit this file or this directory.
@@ -72,6 +72,7 @@ REPORT_ROOT=<workspace>\automation-output\svn审查
 
 Handling rules:
 
+- Prefer running `env-template` to create the workspace-local env file instead of asking the user to create the file manually.
 - Read the env file only in the current process.
 - Never print its contents.
 - `SVN_PASSWORD` may only be passed through `--password-from-stdin`.

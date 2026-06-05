@@ -142,6 +142,17 @@ REPORT_ROOT=$report
 "@
 }
 
+function Ensure-EnvTemplateFile {
+    param([string]$WorkspacePath, [string]$PathText)
+    $envPath = if ($PathText) { $PathText } else { Get-DefaultEnvFile $WorkspacePath }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $envPath) | Out-Null
+    if (-not (Test-Path -LiteralPath $envPath)) {
+        Set-Content -LiteralPath $envPath -Encoding UTF8 -Value (Get-EnvTemplate $WorkspacePath)
+        return [pscustomobject]@{ env_file = $envPath; created = $true }
+    }
+    return [pscustomobject]@{ env_file = $envPath; created = $false }
+}
+
 function Read-EnvFile {
     param([string]$PathText)
     $values = @{}
@@ -532,7 +543,13 @@ function Get-RunId {
 try {
     if ($Command -eq 'env-template') {
         $workspacePath = Ensure-WorkspaceArg
-        Write-Output (Get-EnvTemplate $workspacePath)
+        $envPath = if ($EnvFile) { Assert-PathWithin $EnvFile (Get-AutomationDir $workspacePath) 'env_file' } else { Get-DefaultEnvFile $workspacePath }
+        $template = Ensure-EnvTemplateFile $workspacePath $envPath
+        Write-JsonResult 'ok' @{
+            env_file = $template.env_file
+            created = $template.created
+            message = 'Fill SVN_USERNAME and SVN_PASSWORD in this local env file, then rerun auth-check.'
+        }
         exit 0
     }
 
@@ -572,10 +589,11 @@ try {
             if (-not $workspaceCheck.ok) { Write-JsonResult 'workspace_invalid' @{ workspace_check = $workspaceCheck } }
             $envCanBootstrap = ((Test-Path -LiteralPath $resolved.EnvFile) -and (Test-UsableValue $resolved.Values['SVN_USERNAME']) -and (Test-UsableValue $resolved.Values['SVN_PASSWORD']))
             if ($isRestricted -and -not (Test-Path -LiteralPath $resolved.ConfigDir) -and -not $envCanBootstrap) {
+                $template = Ensure-EnvTemplateFile $workspacePath $resolved.EnvFile
                 Write-JsonResult 'need_env' @{
-                    env_file = $resolved.EnvFile
-                    env_template = (Get-EnvTemplate $workspacePath)
-                    message = 'Create the env file, then rerun auth-check.'
+                    env_file = $template.env_file
+                    env_template_created = $template.created
+                    message = 'Fill SVN_USERNAME and SVN_PASSWORD in this local env file, then rerun auth-check.'
                 }
             }
             if ($isRestricted) { New-Item -ItemType Directory -Force -Path $resolved.ConfigDir | Out-Null }
@@ -599,11 +617,12 @@ try {
                 Write-JsonResult 'auth_failed' @{ restricted = $false; stderr = (Limit-Text $first.Stderr) }
             }
             if (-not (Test-Path -LiteralPath $resolved.EnvFile) -or -not (Test-UsableValue $resolved.Values['SVN_USERNAME']) -or -not (Test-UsableValue $resolved.Values['SVN_PASSWORD'])) {
+                $template = Ensure-EnvTemplateFile $workspacePath $resolved.EnvFile
                 Write-JsonResult 'need_env' @{
-                    env_file = $resolved.EnvFile
-                    env_template = (Get-EnvTemplate $workspacePath)
+                    env_file = $template.env_file
+                    env_template_created = $template.created
                     first_error = (Limit-Text $first.Stderr)
-                    message = 'Create the env file, then rerun auth-check.'
+                    message = 'Fill SVN_USERNAME and SVN_PASSWORD in this local env file, then rerun auth-check.'
                 }
             }
             if (Test-UsableValue $resolved.Values['SVN_CONFIG_DIR']) {
