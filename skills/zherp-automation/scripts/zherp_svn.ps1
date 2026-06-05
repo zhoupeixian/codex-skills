@@ -21,6 +21,10 @@ param(
     [string]$ReportRoot,
     [string]$ReportDate,
     [string]$Name,
+    [string[]]$IncludeAuthors,
+    [string[]]$ExcludeAuthors,
+    [string[]]$SkipMessageContains,
+    [switch]$NoDefaultSkipRules,
     [string[]]$MavenArgs
 )
 
@@ -286,6 +290,21 @@ function Limit-Text {
     return $Text.Substring(0, $Max)
 }
 
+function ConvertTo-StringList {
+    param([string[]]$Values)
+    $items = @()
+    foreach ($value in @($Values)) {
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        foreach ($part in $value.Split(',', [System.StringSplitOptions]::RemoveEmptyEntries)) {
+            $trimmed = $part.Trim()
+            if ($trimmed.Length -gt 0) {
+                $items += ,$trimmed
+            }
+        }
+    }
+    return $items
+}
+
 function Test-Workspace {
     param([string]$WorkspacePath, [string]$SvnCmd)
     if (-not (Test-Path -LiteralPath $WorkspacePath -PathType Container)) {
@@ -475,38 +494,6 @@ function Invoke-EntityGenerateStep {
     }
 }
 
-function Split-Revisions {
-    param([array]$Items)
-    $reviewable = New-Object 'System.Collections.Generic.List[object]'
-    $skipped = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($item in $Items) {
-        $message = [string]$item.message
-        $normalizedMessage = $message -replace '\s+', ''
-        $skip = $false
-        foreach ($token in $SkipLogTokens) {
-            if ($normalizedMessage.Contains($token)) { $skip = $true; break }
-        }
-        if ($skip) { [void]$skipped.Add($item) } else { [void]$reviewable.Add($item) }
-    }
-    return [pscustomobject]@{ Reviewable = $reviewable; Skipped = $skipped }
-}
-
-function Parse-SvnLogXml {
-    param([string]$XmlText)
-    [xml]$xml = $XmlText
-    $items = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($entry in $xml.log.logentry) {
-        $item = [pscustomobject][ordered]@{
-            revision = [string]$entry.revision
-            author = [string]$entry.author
-            date = [string]$entry.date
-            message = [string]$entry.msg
-        }
-        [void]$items.Add($item)
-    }
-    return $items
-}
-
 function Ensure-WorkspaceArg {
     return Get-WorkspacePath
 }
@@ -557,7 +544,7 @@ try {
         'prepare' {
             $svn = Get-SvnCommand $resolved.Values
             $workspaceCheck = Test-Workspace $workspacePath $svn
-            $time = Get-TimeRange
+            $time = if ($Start -or $End -or $BusinessDate) { Get-TimeRange } else { $null }
             $maven = Resolve-Maven $workspacePath $resolved.Values
             $envCanBootstrap = ((Test-Path -LiteralPath $resolved.EnvFile) -and (Test-UsableValue $resolved.Values['SVN_USERNAME']) -and (Test-UsableValue $resolved.Values['SVN_PASSWORD']))
             $needEnv = ($isRestricted -and -not (Test-Path -LiteralPath $resolved.ConfigDir) -and -not $envCanBootstrap)
@@ -659,23 +646,79 @@ try {
             if (-not $svn) { Write-JsonResult 'svn_not_found' }
             $time = Get-TimeRange
             $range = '{' + $time.start + '}:{' + $time.end + '}'
+            $includeAuthorList = @(ConvertTo-StringList $IncludeAuthors)
+            $excludeAuthorList = @(ConvertTo-StringList $ExcludeAuthors)
+            $customSkipTokens = @(ConvertTo-StringList $SkipMessageContains)
+            $defaultSkipTokens = if ($NoDefaultSkipRules) { @() } else { $SkipLogTokens }
+            $messageSkipRules = @()
+            foreach ($token in $defaultSkipTokens) {
+                $messageSkipRules += ,([pscustomobject]@{ type = 'default_message_contains'; token = $token; normalized_token = ($token -replace '\s+', '') })
+            }
+            foreach ($token in $customSkipTokens) {
+                $messageSkipRules += ,([pscustomobject]@{ type = 'message_contains'; token = $token; normalized_token = ($token -replace '\s+', '') })
+            }
             $proc = Invoke-External -CommandArgs (@($svn, 'log', '--xml', '-r', $range) + (Get-SvnArgs $isRestricted $resolved.ConfigDir) + @('.')) -WorkingDirectory $workspacePath
             if ($proc.ExitCode -ne 0) {
                 Write-JsonResult 'log_failed' @{ stderr = (Limit-Text $proc.Stderr); time_range = $time }
             }
-            $revisions = Parse-SvnLogXml $proc.Stdout
-            $split = Split-Revisions $revisions
+            [xml]$logXml = [string]$proc.Stdout
+            $logEntries = New-Object System.Collections.ArrayList
+            $reviewableEntries = New-Object System.Collections.ArrayList
+            $skippedEntries = New-Object System.Collections.ArrayList
+            foreach ($entry in $logXml.SelectNodes('/log/logentry')) {
+                $revision = [pscustomobject]@{
+                    revision = [string]$entry.GetAttribute('revision')
+                    author = [string]$entry.SelectSingleNode('author').InnerText
+                    date = [string]$entry.SelectSingleNode('date').InnerText
+                    message = [string]$entry.SelectSingleNode('msg').InnerText
+                }
+                [void]$logEntries.Add($revision)
+                $normalizedMessage = $revision.message -replace '\s+', ''
+                $skipReason = $null
+                if ($includeAuthorList.Count -gt 0 -and -not ($includeAuthorList -contains $revision.author)) {
+                    $skipReason = 'include_author_mismatch:' + $revision.author
+                }
+                if (-not $skipReason -and $excludeAuthorList -contains $revision.author) {
+                    $skipReason = 'exclude_author:' + $revision.author
+                }
+                if (-not $skipReason) {
+                    foreach ($rule in $messageSkipRules) {
+                        if ($normalizedMessage.Contains($rule.normalized_token)) {
+                            $skipReason = $rule.type + ':' + $rule.token
+                            break
+                        }
+                    }
+                }
+                if ($skipReason) {
+                    [void]$skippedEntries.Add([pscustomobject]@{
+                        revision = $revision.revision
+                        author = $revision.author
+                        date = $revision.date
+                        message = $revision.message
+                        skip_reason = $skipReason
+                    })
+                } else {
+                    [void]$reviewableEntries.Add($revision)
+                }
+            }
+            $filterConfig = [pscustomobject][ordered]@{
+                include_authors = $includeAuthorList
+                exclude_authors = $excludeAuthorList
+                skip_message_contains = $customSkipTokens
+                default_skip_rules = (-not [bool]$NoDefaultSkipRules)
+            }
             $logPayload = [pscustomobject][ordered]@{
                 schema_version = 1
                 generated_at = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
                 workspace = $workspacePath
                 time_range = $time
-                count = $revisions.Count
-                reviewable_count = $split.Reviewable.Count
-                skipped_count = $split.Skipped.Count
-                revisions = $revisions
-                reviewable_revisions = $split.Reviewable
-                skipped_revisions = $split.Skipped
+                filter = $filterConfig
+                count = $logEntries.Count
+                reviewable_count = $reviewableEntries.Count
+                skipped_count = $skippedEntries.Count
+                revisions = $logEntries
+                reviewable_revisions = $reviewableEntries
+                skipped_revisions = $skippedEntries
             }
             if ($Output) {
                 $outputPath = Assert-PathWithin $Output $workspacePath 'log_output'
@@ -684,12 +727,13 @@ try {
             }
             Write-JsonResult 'ok' @{
                 time_range = $time
-                count = $revisions.Count
-                reviewable_count = $split.Reviewable.Count
-                skipped_count = $split.Skipped.Count
-                revisions = $revisions
-                reviewable_revisions = $split.Reviewable
-                skipped_revisions = $split.Skipped
+                filter = $filterConfig
+                count = $logEntries.Count
+                reviewable_count = $reviewableEntries.Count
+                skipped_count = $skippedEntries.Count
+                revisions = $logEntries
+                reviewable_revisions = $reviewableEntries
+                skipped_revisions = $skippedEntries
                 output = $Output
             }
         }
@@ -701,8 +745,8 @@ try {
             $defaultDiffRoot = Join-Path (Join-Path (Join-Path (Get-DefaultReportRoot $workspacePath) $today) ('run-' + (Get-RunId))) 'diffs'
             $outDir = if ($OutputDir) { Assert-PathWithin $OutputDir $workspacePath 'diff_output_dir' } else { $defaultDiffRoot }
             New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-            $diffs = New-Object 'System.Collections.Generic.List[object]'
-            $missing = New-Object 'System.Collections.Generic.List[object]'
+            $diffs = New-Object System.Collections.ArrayList
+            $missing = New-Object System.Collections.ArrayList
             foreach ($revText in $Revisions) {
                 foreach ($rev in ($revText -replace ',', ' ').Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)) {
                     $clean = Assert-Revision ($rev.Trim().TrimStart('r'))
@@ -759,7 +803,7 @@ try {
         'post-log-prep' {
             $svn = Get-SvnCommand $resolved.Values
             if (-not $svn) { Write-JsonResult 'svn_not_found' }
-            $steps = New-Object 'System.Collections.Generic.List[object]'
+            $steps = New-Object System.Collections.ArrayList
             $step = Invoke-SvnUpdateStep $workspacePath $svn $isRestricted $resolved.ConfigDir
             [void]$steps.Add([pscustomobject]$step)
             if ($step.status -ne 'ok') { Write-JsonResult $step.status @{ steps = $steps; failed_step = $step.name } }
