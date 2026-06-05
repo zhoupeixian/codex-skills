@@ -32,7 +32,10 @@ $RightCjkBracket = [string][char]0x3011
 $ReleaseVersionText = -join ([char[]](0x53d1, 0x5e03, 0x7248, 0x672c))
 $ReviewText = -join ([char[]](0x5ba1, 0x67e5))
 $LogText = -join ([char[]](0x65e5, 0x5fd7))
-$SkipLogPatterns = @($LeftCjkBracket + ' ZHERP' + $RightCjkBracket, $LeftCjkBracket + 'Jenkins ' + $ReleaseVersionText + $RightCjkBracket)
+$SkipLogTokens = @(
+    ($LeftCjkBracket + 'ZHERP' + $RightCjkBracket),
+    ($LeftCjkBracket + 'Jenkins' + $ReleaseVersionText + $RightCjkBracket)
+)
 $DefaultEntityModule = '../erp-entity-generator'
 $DefaultReportRoot = 'automation-output\svn' + $ReviewText
 
@@ -474,15 +477,16 @@ function Invoke-EntityGenerateStep {
 
 function Split-Revisions {
     param([array]$Items)
-    $reviewable = @()
-    $skipped = @()
+    $reviewable = New-Object 'System.Collections.Generic.List[object]'
+    $skipped = New-Object 'System.Collections.Generic.List[object]'
     foreach ($item in $Items) {
         $message = [string]$item.message
+        $normalizedMessage = $message -replace '\s+', ''
         $skip = $false
-        foreach ($pattern in $SkipLogPatterns) {
-            if ($message.Contains($pattern)) { $skip = $true; break }
+        foreach ($token in $SkipLogTokens) {
+            if ($normalizedMessage.Contains($token)) { $skip = $true; break }
         }
-        if ($skip) { $skipped += $item } else { $reviewable += $item }
+        if ($skip) { [void]$skipped.Add($item) } else { [void]$reviewable.Add($item) }
     }
     return [pscustomobject]@{ Reviewable = $reviewable; Skipped = $skipped }
 }
@@ -490,14 +494,15 @@ function Split-Revisions {
 function Parse-SvnLogXml {
     param([string]$XmlText)
     [xml]$xml = $XmlText
-    $items = @()
+    $items = New-Object 'System.Collections.Generic.List[object]'
     foreach ($entry in $xml.log.logentry) {
-        $items += [pscustomobject][ordered]@{
+        $item = [pscustomobject][ordered]@{
             revision = [string]$entry.revision
             author = [string]$entry.author
             date = [string]$entry.date
             message = [string]$entry.msg
         }
+        [void]$items.Add($item)
     }
     return $items
 }
@@ -696,8 +701,8 @@ try {
             $defaultDiffRoot = Join-Path (Join-Path (Join-Path (Get-DefaultReportRoot $workspacePath) $today) ('run-' + (Get-RunId))) 'diffs'
             $outDir = if ($OutputDir) { Assert-PathWithin $OutputDir $workspacePath 'diff_output_dir' } else { $defaultDiffRoot }
             New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-            $diffs = @()
-            $missing = @()
+            $diffs = New-Object 'System.Collections.Generic.List[object]'
+            $missing = New-Object 'System.Collections.Generic.List[object]'
             foreach ($revText in $Revisions) {
                 foreach ($rev in ($revText -replace ',', ' ').Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)) {
                     $clean = Assert-Revision ($rev.Trim().TrimStart('r'))
@@ -705,9 +710,9 @@ try {
                     $proc = Invoke-External -CommandArgs (@($svn, 'diff', '-c', $clean) + (Get-SvnArgs $isRestricted $resolved.ConfigDir) + @('.')) -WorkingDirectory $workspacePath
                     if ($proc.ExitCode -eq 0) {
                         Set-Content -LiteralPath $file -Encoding UTF8 -Value $proc.Stdout
-                        $diffs += [ordered]@{ revision = $clean; file = $file; bytes = ([Text.Encoding]::UTF8.GetByteCount($proc.Stdout)) }
+                        [void]$diffs.Add([pscustomobject][ordered]@{ revision = $clean; file = $file; bytes = ([Text.Encoding]::UTF8.GetByteCount($proc.Stdout)) })
                     } else {
-                        $missing += [ordered]@{ revision = $clean; stderr = (Limit-Text $proc.Stderr) }
+                        [void]$missing.Add([pscustomobject][ordered]@{ revision = $clean; stderr = (Limit-Text $proc.Stderr) })
                     }
                 }
             }
@@ -754,15 +759,15 @@ try {
         'post-log-prep' {
             $svn = Get-SvnCommand $resolved.Values
             if (-not $svn) { Write-JsonResult 'svn_not_found' }
-            $steps = @()
+            $steps = New-Object 'System.Collections.Generic.List[object]'
             $step = Invoke-SvnUpdateStep $workspacePath $svn $isRestricted $resolved.ConfigDir
-            $steps += $step
+            [void]$steps.Add([pscustomobject]$step)
             if ($step.status -ne 'ok') { Write-JsonResult $step.status @{ steps = $steps; failed_step = $step.name } }
             $step = Invoke-EntityGenerateStep $workspacePath $resolved.Values
-            $steps += $step
+            [void]$steps.Add([pscustomobject]$step)
             if ($step.status -ne 'ok') { Write-JsonResult $step.status @{ steps = $steps; failed_step = $step.name; maven = $step.maven } }
             $step = Invoke-MavenBuildStep $workspacePath $resolved.Values
-            $steps += $step
+            [void]$steps.Add([pscustomobject]$step)
             if ($step.status -ne 'ok') { Write-JsonResult $step.status @{ steps = $steps; failed_step = $step.name; maven = $step.maven } }
             Write-JsonResult 'ok' @{ steps = $steps }
         }
