@@ -71,18 +71,17 @@ REPORT_ROOT=<workspace>\automation-output\svn审查
 
 `$env:USERPROFILE\.codex\automations` 是 Codex 自动化记忆/状态目录，不是 SVN 认证配置目录，也不是本前置探测步骤的认证资料来源。SVN 受限环境配置仍优先放在 `<workspace>\.zherp-automation`。
 
-只有本次任务需要写入或更新自动化记忆、状态文件、运行记录、审查日志索引，或当前运行明确属于自动化任务时，才在流程开头轻量探测 `automations` 是否可访问、必要时是否可写。普通会话只使用本 skill 做 SVN 日志、更新、构建、实体生成或代码审查时，可以跳过本节，不要因为 `automations` 不存在或不可写而阻塞主流程。本前置探测步骤禁止读取或复用其中的历史文件。
+只有本次任务需要写入或更新自动化记忆、状态文件、运行记录、审查日志索引，或当前运行明确属于自动化任务时，才在流程开头探测 `automations` 是否可访问、必要时是否可写。普通会话只使用本 skill 做 SVN 日志、更新、构建、实体生成或代码审查时，可以跳过本节，不要因为 `automations` 不存在或不可写而阻塞主流程。
 
 检查顺序：
 
 1. Codex 先用 `$env:USERPROFILE` 解析实际目录：`$automations = Join-Path $env:USERPROFILE ".codex\automations"`。
-2. 只允许检查目录是否存在、能否访问；目录不存在时可以创建。
-3. 需要确认可写时，只允许写入一个不含敏感信息的临时检查标记，然后立即删除该标记。
-4. 本前置探测步骤禁止列出、读取、搜索或解析 `automations` 目录下的任何已有文件。
-5. 本前置探测步骤禁止使用 `automations` 目录里的历史日志、记忆、状态文件或历史成功命令作为 SVN 认证依据。
-6. 本前置探测步骤禁止从 `automations` 目录获取 `svn_config_dir`、`SVN_USERNAME`、`SVN_PASSWORD` 或任何认证参数。
-7. 如果无法访问或写入，且本次任务确实需要写自动化记忆/状态，再检查 `$env:USERPROFILE\.codex\config.toml` 是否存在 `writable_roots` 配置。
-8. 如果 `config.toml` 不存在、无法访问，或没有包含该目录，只阻塞会写自动化记忆/状态的步骤，并要求用户在 `config.toml` 中加入实际用户目录，例如：
+2. 检查目录是否存在、能否访问；目录不存在时可以创建。
+3. 需要确认可写时，写入一个不含敏感信息的临时检查标记，然后立即删除该标记。
+4. 自动化运行可按任务需要读取或更新自己的记忆/状态文件，但这些内容只能作为历史上下文，不能作为本轮 SVN 认证配置、revision 列表、diff 或审查结论的替代证据。
+5. 禁止从 `automations` 目录获取 `svn_config_dir`、`SVN_USERNAME`、`SVN_PASSWORD` 或任何认证参数；SVN 受限环境配置只走 `<workspace>\.zherp-automation`。
+6. 如果无法访问或写入，且本次任务确实需要写自动化记忆/状态，再检查 `$env:USERPROFILE\.codex\config.toml` 是否存在 `writable_roots` 配置。
+7. 如果 `config.toml` 不存在、无法访问，或没有包含该目录，只阻塞会写自动化记忆/状态的步骤，并要求用户在 `config.toml` 中加入实际用户目录，例如：
 
 ```toml
 writable_roots = ["C:\\Users\\actual-user\\.codex\\automations"]
@@ -90,7 +89,7 @@ writable_roots = ["C:\\Users\\actual-user\\.codex\\automations"]
 
 不要因为 `automations` 不可写而绕开到主用户 SVN auth 缓存。
 
-完成本前置探测后，如果后续自动化任务本身需要读取或更新自动化记忆，可以按任务需要处理；但 SVN 认证配置来源仍只能按 `workspace` 和 `<workspace>\.zherp-automation` 流程确认，不能用 `automations` 历史文件替代。
+完成探测后，如果后续自动化任务本身需要读取或更新自动化记忆，可以按任务需要处理；但 SVN 认证配置来源仍只能按 `workspace` 和 `<workspace>\.zherp-automation` 流程确认，不能用 `automations` 历史文件替代。
 
 ## SVN 命令形态
 
@@ -176,6 +175,16 @@ svn diff -c <revision> @svnArgs .
 ```
 
 本轮审查只能使用本轮 `log.json`、本轮 diff manifest 和本轮新写入的审查日志。不要把日期目录中已有的旧 `log.json`、旧 diff、旧审查日志或自动化记忆当成本轮结果。
+
+`log.json` 是脚本生成的规范对象，顶层包含：
+
+- `schema_version`
+- `time_range`
+- `revisions`
+- `reviewable_revisions`
+- `skipped_revisions`
+
+不要把它当成原始 revision 数组解析。脚本 `log` 返回 `ok` 时，优先使用 stdout JSON 的 `reviewable_revisions`；需要从文件恢复时读取 `log.json.reviewable_revisions`。不要因为解析预期错误而绕过脚本重跑手写 `svn log --xml`。
 
 ## 认证恢复
 

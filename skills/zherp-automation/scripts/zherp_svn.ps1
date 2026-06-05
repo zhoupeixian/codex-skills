@@ -492,7 +492,7 @@ function Parse-SvnLogXml {
     [xml]$xml = $XmlText
     $items = @()
     foreach ($entry in $xml.log.logentry) {
-        $items += [ordered]@{
+        $items += [pscustomobject][ordered]@{
             revision = [string]$entry.revision
             author = [string]$entry.author
             date = [string]$entry.date
@@ -660,10 +660,22 @@ try {
             }
             $revisions = Parse-SvnLogXml $proc.Stdout
             $split = Split-Revisions $revisions
+            $logPayload = [pscustomobject][ordered]@{
+                schema_version = 1
+                generated_at = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                workspace = $workspacePath
+                time_range = $time
+                count = $revisions.Count
+                reviewable_count = $split.Reviewable.Count
+                skipped_count = $split.Skipped.Count
+                revisions = $revisions
+                reviewable_revisions = $split.Reviewable
+                skipped_revisions = $split.Skipped
+            }
             if ($Output) {
                 $outputPath = Assert-PathWithin $Output $workspacePath 'log_output'
                 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $outputPath) | Out-Null
-                $revisions | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $outputPath -Encoding UTF8
+                $logPayload | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $outputPath -Encoding UTF8
             }
             Write-JsonResult 'ok' @{
                 time_range = $time
