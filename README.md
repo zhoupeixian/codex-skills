@@ -15,6 +15,7 @@ skills/
     SKILL.md
     agents/
     references/
+    references/usage-guide.md
 ```
 
 ## Skills
