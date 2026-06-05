@@ -533,6 +533,10 @@ function Assert-DatePart {
     return $DateText
 }
 
+function Get-RunId {
+    return (Get-Date).ToString('yyyyMMdd-HHmmss')
+}
+
 try {
     if ($Command -eq 'env-template') {
         $workspacePath = Ensure-WorkspaceArg
@@ -676,7 +680,8 @@ try {
             $svn = Get-SvnCommand $resolved.Values
             if (-not $svn) { Write-JsonResult 'svn_not_found' }
             if (-not $Revisions -or $Revisions.Count -eq 0) { Write-JsonResult 'config_error' @{ message = 'Revisions are required.' } }
-            $defaultDiffRoot = Join-Path (Join-Path (Get-DefaultReportRoot $workspacePath) ((Get-Date).ToString('yyyy-MM-dd'))) ('diffs-' + (Get-Date).ToString('HHmmss'))
+            $today = (Get-Date).ToString('yyyy-MM-dd')
+            $defaultDiffRoot = Join-Path (Join-Path (Join-Path (Get-DefaultReportRoot $workspacePath) $today) ('run-' + (Get-RunId))) 'diffs'
             $outDir = if ($OutputDir) { Assert-PathWithin $OutputDir $workspacePath 'diff_output_dir' } else { $defaultDiffRoot }
             New-Item -ItemType Directory -Force -Path $outDir | Out-Null
             $diffs = @()
@@ -752,9 +757,10 @@ try {
         'report-path' {
             $root = if ($ReportRoot) { Assert-PathWithin $ReportRoot $workspacePath 'report_root' } elseif (Test-UsableValue $resolved.Values['REPORT_ROOT']) { Assert-PathWithin $resolved.Values['REPORT_ROOT'] $workspacePath 'report_root' } else { Get-DefaultReportRoot $workspacePath }
             $datePart = if ($ReportDate) { Assert-DatePart $ReportDate } else { (Get-Date).ToString('yyyy-MM-dd') }
-            $dir = Join-Path $root $datePart
+            $runId = Get-RunId
+            $dir = Join-Path (Join-Path $root $datePart) ('run-' + $runId)
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
-            $fileName = if ($Name) { Assert-LeafFileName $Name } else { 'svn' + $ReviewText + $LogText + '-' + $datePart + '.md' }
+            $fileName = if ($Name) { Assert-LeafFileName $Name } else { 'svn' + $ReviewText + $LogText + '-' + $runId + '.md' }
             $file = Join-Path $dir $fileName
             if (Test-Path -LiteralPath $file) {
                 $base = [IO.Path]::GetFileNameWithoutExtension($fileName)

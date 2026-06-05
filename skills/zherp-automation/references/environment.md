@@ -100,8 +100,8 @@ writable_roots = ["C:\\Users\\actual-user\\.codex\\automations"]
 $restricted = "<yes-or-no-after-agent-judgement>"
 powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 prepare -Workspace <workspace> -Start "<start>" -End "<end>" -Restricted $restricted
 powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 auth-check -Workspace <workspace> -Restricted $restricted
-powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 log -Workspace <workspace> -Start "<start>" -End "<end>" -Restricted $restricted
-powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 diff -Workspace <workspace> -Revisions r123 r124 -Restricted $restricted
+powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 log -Workspace <workspace> -Start "<start>" -End "<end>" -Restricted $restricted -Output <run_dir>\log.json
+powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 diff -Workspace <workspace> -Revisions r123 r124 -Restricted $restricted -OutputDir <run_dir>\diffs
 powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 update -Workspace <workspace> -Restricted $restricted
 powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 post-log-prep -Workspace <workspace> -Restricted $restricted
 powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 maven-build -Workspace <workspace>
@@ -168,6 +168,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps
 ```powershell
 svn diff -c <revision> @svnArgs .
 ```
+
+每次运行必须先确定本轮 `run_started_at` 和 `run_dir`，例如：
+
+```text
+<workspace>\automation-output\svn审查\<YYYY-MM-DD>\run-<yyyyMMdd-HHmmss>
+```
+
+本轮审查只能使用本轮 `log.json`、本轮 diff manifest 和本轮新写入的审查日志。不要把日期目录中已有的旧 `log.json`、旧 diff、旧审查日志或自动化记忆当成本轮结果。
 
 ## 认证恢复
 

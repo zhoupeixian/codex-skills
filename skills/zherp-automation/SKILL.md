@@ -19,17 +19,31 @@ description: Automate ZHERP/YigoERP SVN workflows with strict SVN authentication
 - SVN 认证配置只以本次用户提供的信息和 `<workspace>\.zherp-automation` 下的文件为准；不要从 memory、历史会话、自动化记忆或 rollout 记录中复用历史成功方式。
 - `<workspace>\.zherp-automation` 是本机私有自动化配置目录，可能包含 SVN 认证缓存或本机路径；禁止把它加入 SVN 或提交。
 
+## 本轮运行证据边界
+
+每次执行都必须先建立本轮运行身份，防止把历史产物当成本轮结果：
+
+1. 在执行 `auth-check` 前记录 `run_started_at`，格式使用本机时间 `yyyy-MM-dd HH:mm:ss`。
+2. 本轮日志、diff 和审查日志必须写入本轮专属输出位置，推荐使用 `report_root\<YYYY-MM-DD>\run-<yyyyMMdd-HHmmss>\`。如果仍使用日期目录，文件名必须带本轮时间戳。
+3. 调用 `log` 时必须显式传 `-Output <本轮run目录>\log.json`；调用 `diff` 时必须显式传 `-OutputDir <本轮run目录>\diffs`。
+4. 代码审查只能基于本轮 `log` 返回的 `reviewable_revisions` 和本轮 `diff` 返回的 manifest。禁止基于当天目录已有的 `log.json`、旧 diff、旧审查日志或自动化记忆做本轮审查结论。
+5. 引用或汇报任何本地审查日志前，必须确认该文件是本轮新写入的文件，且 `LastWriteTime >= run_started_at`。如果没有本轮新审查日志，就必须汇报“本轮未生成新的审查日志”，禁止把历史同名或同日期日志当成本轮产物。
+6. 自动化记忆只能作为历史上下文；不得作为本轮 revision 列表、diff、问题清单、审查结论或“已生成报告”的证据来源。
+7. 只有本轮审查日志已经成功落盘后，才允许把本轮摘要写入自动化记忆；记忆内容必须指向本轮新报告路径和本轮时间戳。
+8. 最终汇报必须包含本轮证据清单：`time_range`、本轮 `log.json` 路径、diff manifest 路径（如执行了审查）、审查日志路径（如生成了审查日志）。缺少其中任一项时，必须明确说明缺失原因。
+
 ## 固定执行顺序
 
 任何任务都按这个顺序走，缺哪一步就停在那一步，不要跳到后面补救：
 
 1. 判断本次任务是否需要自动化记忆目录；普通会话不需要时跳过该探测。
-2. 确认 `workspace` 和 `time_range`；用户说“当日、当天、今日提交”但未给起止时间时，按默认业务日窗口处理。完全没说时间范围时，再询问用户。
-3. 验证 `workspace` 是本地 SVN 工作副本。
-4. 判断当前是否为沙箱、CI 或受限自动化用户，并准备 `@svnArgs`。
-5. 执行第一阶段：最小认证验证，再拉日志。
-6. 第一阶段失败就停止；第一阶段成功后，只执行用户明确要求的后续动作。
-7. 只有用户明确要求代码审查时，才执行完整审查流程并生成审查日志。
+2. 建立本轮运行身份：记录 `run_started_at`，确定本轮专属输出目录。
+3. 确认 `workspace` 和 `time_range`；用户说“当日、当天、今日提交”但未给起止时间时，按默认业务日窗口处理。完全没说时间范围时，再询问用户。
+4. 验证 `workspace` 是本地 SVN 工作副本。
+5. 判断当前是否为沙箱、CI 或受限自动化用户，并准备 `@svnArgs`。
+6. 执行第一阶段：最小认证验证，再拉日志。
+7. 第一阶段失败就停止；第一阶段成功后，只执行用户明确要求的后续动作。
+8. 只有用户明确要求代码审查时，才执行完整审查流程并生成审查日志。
 
 ## 流程决策树
 
@@ -104,11 +118,13 @@ flowchart TD
 
 ```powershell
 $restricted = "<yes-or-no-after-agent-judgement>"
+$runId = Get-Date -Format "yyyyMMdd-HHmmss"
+$runDir = Join-Path <workspace> ("automation-output\svn审查\" + (Get-Date -Format "yyyy-MM-dd") + "\run-" + $runId)
 powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 prepare -Workspace <workspace> -Start "<start>" -End "<end>" -Restricted $restricted
 powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 auth-check -Workspace <workspace> -Restricted $restricted
-powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 log -Workspace <workspace> -Start "<start>" -End "<end>" -Restricted $restricted
+powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 log -Workspace <workspace> -Start "<start>" -End "<end>" -Restricted $restricted -Output (Join-Path $runDir "log.json")
 powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 post-log-prep -Workspace <workspace> -Restricted $restricted
-powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 diff -Workspace <workspace> -Revisions r123 r124 -Restricted $restricted
+powershell -NoProfile -ExecutionPolicy Bypass -File <skill>\scripts\zherp_svn.ps1 diff -Workspace <workspace> -Revisions r123 r124 -Restricted $restricted -OutputDir (Join-Path $runDir "diffs")
 ```
 
 需要模板时使用：
@@ -281,7 +297,7 @@ REPORT_ROOT=<workspace>\automation-output\svn审查
 5. 如果更新、Maven 构建或实体生成失败，立即停止并汇报失败阶段、命令意图和关键错误。不要继续拉 diff 和审查。
 6. 调用脚本 `diff` 对每个需要审查的 revision 单独拉取 diff。只基于成功取得的日志和 diff 做分析。
 7. 如果部分 revision 无法拉取 diff，审查日志中必须写明：`部分 revision 缺少 diff，结论受限`。
-8. 生成标准级 Markdown 审查日志并保存到按日期归档的目录。
+8. 生成标准级 Markdown 审查日志并保存到本轮专属输出目录。
 
 Maven 规则：
 
@@ -319,4 +335,4 @@ Maven 规则：
 
 审查日志模板见 [report-template.md](references/report-template.md)。
 
-落盘时保存到 `report_root\<YYYY-MM-DD>\`。如果同名历史审查日志已存在，生成带时间戳的新文件；只有确认是同一次运行创建的临时文件时，才允许覆盖。
+落盘时保存到本轮专属输出目录，例如 `report_root\<YYYY-MM-DD>\run-<yyyyMMdd-HHmmss>\svn审查日志-<yyyyMMdd-HHmmss>.md`。如果同名历史审查日志已存在，生成带时间戳的新文件；只有确认是同一次运行创建的临时文件时，才允许覆盖。最终汇报前必须核对报告文件 `LastWriteTime >= run_started_at`。
